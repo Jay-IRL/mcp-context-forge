@@ -38,7 +38,7 @@ def post_process_nl_test_cases(nl_test_cases):
             
 
 async def validation_generate_test_cases(tool_id,tool_service: ToolService, db: Session,LLM_PLATFORM = 'WATSONX',LLM_MODEL_ID = 'mistralai/mistral-medium-2505',
-                                   NUMBER_OF_TESTCASES = 5,NUMBER_OF_UTTERANCES = 2):
+                                   NUMBER_OF_TESTCASES = 2,NUMBER_OF_UTTERANCES = 2):
     test_cases = []
     try:
         #mcp_cf_tool=get_mcp_cf_tool(tool_id)
