@@ -126,7 +126,14 @@
                     },
                     "time_off_types": {
                         "items": {
-                            "$ref": "#/components/schemas/TimeOffTypes"
+                            "type": "string",
+                            "enum": [
+                                "ABSENCE",
+                                "PUBLIC_HOLIDAY",
+                                "NON_WORKING_DAY"
+                            ],
+                            "title": "TimeOffTypes",
+                            "description": "Represents the time off event types in SAP SuccessFactors."
                         },
                         "type": "array",
                         "title": "Time Off Types",
@@ -142,16 +149,6 @@
                 ],
                 "title": "TimeOffRequest",
                 "description": "Request model for getting upcoming time off."
-            },
-            "TimeOffTypes": {
-                "type": "string",
-                "enum": [
-                    "ABSENCE",
-                    "PUBLIC_HOLIDAY",
-                    "NON_WORKING_DAY"
-                ],
-                "title": "TimeOffTypes",
-                "description": "Represents the time off event types in SAP SuccessFactors."
             },
             "UpcomingTimeOff": {
                 "properties": {
