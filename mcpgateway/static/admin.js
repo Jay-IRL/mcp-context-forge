@@ -9103,10 +9103,12 @@ async function enrichTool(toolId) {
         const oldDesc = safeGetElement("view-old-description");
 
         if (newDesc) {
-            newDesc.textContent = data.enriched_desc || "Unknown";
+            newDesc.textContent = data.enriched_desc || "";
         }
         if (oldDesc) {
-            oldDesc.textContent = data.original_desc || "Unknown";
+            oldDesc.textContent =
+                data.original_desc.slice(0, data.original_desc.indexOf("*")) ||
+                "";
         }
         openModal("description-view-modal");
         // showSuccessMessage(`Tool enriched successfully`);
@@ -9906,9 +9908,10 @@ async function validateTool(toolId) {
                                         );
                                     });
 
-                                    if (Array.isArray(prop.default)) {
-                                        if (prop.default.length > 0) {
-                                            prop.default.forEach((val) => {
+                                    defaultValue = defaultValue[0];
+                                    if (Array.isArray(defaultValue)) {
+                                        if (defaultValue.length > 0) {
+                                            defaultValue.forEach((val) => {
                                                 arrayContainer.appendChild(
                                                     createArrayInput(val),
                                                 );
