@@ -219,12 +219,18 @@ async def execute_tool_nl_test_cases(tool_id, tool_nl_test_cases, tool_service: 
     # we execute each nl test case and if there are any errors we add that to test case output
     for nl_utterance in tool_nl_test_cases:
         try:
-            tool_output = await service.chat(message=nl_utterance)
-            tool_test_case_outputs.append(tool_output)
+            #tool_output = await service.chat(message=nl_utterance)
+            # tool_output = await service.raw_stream_events(message=nl_utterance).__anext__()
+            # tool_test_case_outputs.append(langchain_dumps(tool_output))
+            all_events = await service.raw_stream_events(message=nl_utterance)
+            tool_test_case_outputs.append(all_events)
         except Exception as e:
             logger.info("Error in executing tool validation test cases with MCP server - " + str(e))
             tool_test_case_outputs.append(str(e))
             continue
+    with open("tool_execution.json",'w') as tef:
+        json.dump(tool_test_case_outputs,tef,indent=2)
+    tef.close()
     return tool_test_case_outputs
 
 
