@@ -2203,7 +2203,78 @@ class MCPChatService:
             "elapsed_ms": final.get("elapsed_ms"),
         }
 
-    async def raw_stream_events(self, message: str) -> list:
+    # async def raw_stream_events(self, message: str) -> list:
+    #     """
+    #     Send a message and stream the response.
+
+    #     Yields response chunks as they're generated, enabling real-time display
+    #     of the AI's response.
+
+    #     Args:
+    #         message: User's message text.
+
+    #     Yields:
+    #         str: Chunks of AI response text.
+
+    #     Raises:
+    #         RuntimeError: If service not initialized.
+    #         Exception: If streaming fails.
+
+    #     Examples:
+    #         >>> import asyncio
+    #         >>> async def stream_example():
+    #         ...     # Assuming service is initialized
+    #         ...     chunks = []
+    #         ...     async for chunk in service.chat_stream("Hello"):
+    #         ...         chunks.append(chunk)
+    #         ...     return ''.join(chunks)
+    #         >>> # full_response = asyncio.run(stream_example())
+
+    #     Note:
+    #         Falls back to non-streaming if enable_streaming is False in config.
+    #     """
+    #     all_events = []
+    #     if not self._initialized or not self._agent:
+    #         raise RuntimeError("Chat service not initialized. Call initialize() first.")
+
+    #     # if not self.config.enable_streaming:
+    #     #     # Fall back to non-streaming
+    #     #     response = await self.chat(message)
+    #     #     yield response
+    #     #     return
+
+    #     try:
+    #         import uuid
+    #         from langchain_core.load.dump import dumps as langchain_dumps
+    #         logger.debug("Processing streaming chat message...")
+    #         thread_id = "thread_id_" + uuid.uuid4().hex
+    #         config = {"configurable": {"thread_id": thread_id}}
+    #         logger.info("Agent flow execution events ")
+            
+    #         async for i, event in enumerate(
+    #             self._agent.astream_events(
+    #                 {"messages": [("user", message)]},
+    #                 config,
+    #                 stream_mode="updates",
+    #             )
+    #         ):
+    #             turn_id = "turn_id_" + str(i + 1)
+    #             turn_event = {
+    #                 "turn_id": turn_id,
+    #                 "turn_event": langchain_dumps(event),
+    #             }
+    #             all_events.append(turn_event)
+    #             logger.info(
+    #                 "Agent execution turn event - " + json.dumps(turn_event)
+    #             )
+
+    #         logger.debug("Streaming chat message processed successfully")
+    #         return all_events
+    #     except Exception as e:
+    #         logger.error(f"Error processing streaming chat message: {e}")
+    #         raise
+
+    async def raw_stream_events(self, message: str) -> AsyncGenerator[str, None]:
         """
         Send a message and stream the response.
 
@@ -2233,43 +2304,39 @@ class MCPChatService:
         Note:
             Falls back to non-streaming if enable_streaming is False in config.
         """
-        all_events = []
         if not self._initialized or not self._agent:
             raise RuntimeError("Chat service not initialized. Call initialize() first.")
 
-        # if not self.config.enable_streaming:
-        #     # Fall back to non-streaming
-        #     response = await self.chat(message)
-        #     yield response
-        #     return
+        if not self.config.enable_streaming:
+            # Fall back to non-streaming
+            response = await self.chat(message)
+            yield response
+            return
 
         try:
-            import uuid
-            from langchain_core.load.dump import dumps as langchain_dumps
             logger.debug("Processing streaming chat message...")
-            thread_id = "thread_id_" + uuid.uuid4().hex
-            config = {"configurable": {"thread_id": thread_id}}
-            logger.info("Agent flow execution events ")
-            
-            async for i, event in enumerate(
-                self._agent.astream_events(
-                    {"messages": [("user", message)]},
-                    config,
-                    stream_mode="updates",
-                )
-            ):
-                turn_id = "turn_id_" + str(i + 1)
-                turn_event = {
-                    "turn_id": turn_id,
-                    "turn_event": langchain_dumps(event),
-                }
-                all_events.append(turn_event)
-                logger.info(
-                    "Agent execution turn event - " + json.dumps(turn_event)
-                )
+
+            # Get conversation history
+            # lc_messages = await self.history_manager.get_langchain_messages(self.user_id) if self.user_id else []
+            lc_messages = []
+
+            # Add user message
+            user_message = HumanMessage(content=message)
+            lc_messages.append(user_message)
+
+            # Stream agent response
+            full_response = ""
+            #[("user", message)]
+            async for event in self._agent.astream({"messages": [("user", message)]}, stream_mode="updates"):
+                yield event
+
+            # Save history
+            if self.user_id and full_response:
+                await self.history_manager.append_message(self.user_id, "user", message)
+                await self.history_manager.append_message(self.user_id, "assistant", full_response)
 
             logger.debug("Streaming chat message processed successfully")
-            return all_events
+
         except Exception as e:
             logger.error(f"Error processing streaming chat message: {e}")
             raise

@@ -33,6 +33,7 @@ try:
     from altk.build_time.test_case_generation_toolkit.src.toolops.generation.test_case_generation.test_case_generation import TestcaseGeneration
     from altk.build_time.test_case_generation_toolkit.src.toolops.generation.test_case_generation.test_case_generation_utils import prompt_execution
     from altk.build_time.test_case_generation_toolkit.src.toolops.utils import llm_util
+    from langchain_core.load.dump import dumps as langchain_dumps
 except ImportError:
     prompt_utils = None
     ToolOpsMCPCFToolEnrichment = None
@@ -222,7 +223,9 @@ async def execute_tool_nl_test_cases(tool_id, tool_nl_test_cases, tool_service: 
             #tool_output = await service.chat(message=nl_utterance)
             # tool_output = await service.raw_stream_events(message=nl_utterance).__anext__()
             # tool_test_case_outputs.append(langchain_dumps(tool_output))
-            all_events = await service.raw_stream_events(message=nl_utterance)
+            all_events = []
+            async for event in service.raw_stream_events(message=nl_utterance):
+                all_events.append(langchain_dumps(event))
             tool_test_case_outputs.append(all_events)
         except Exception as e:
             logger.info("Error in executing tool validation test cases with MCP server - " + str(e))
