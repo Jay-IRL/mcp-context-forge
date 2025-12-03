@@ -2327,7 +2327,7 @@ class MCPChatService:
             # Stream agent response
             full_response = ""
             #[("user", message)]
-            async for event in self._agent.astream({"messages": [("user", message)]}, stream_mode="updates"):
+            async for event in self._agent.astream({"messages": lc_messages}, version="v2", stream_mode="updates"):
                 yield event
 
             # Save history
