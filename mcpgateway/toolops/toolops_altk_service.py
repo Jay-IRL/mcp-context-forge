@@ -23,6 +23,7 @@ Structure:
 import json
 import os
 from typing import Any
+import uuid
 
 try:
     # Third-Party
@@ -187,7 +188,7 @@ async def validation_generate_test_cases(tool_id, tool_service: ToolService, db:
     return test_cases
 
 
-async def execute_tool_nl_test_cases(tool_id, tool_nl_test_cases, tool_service: ToolService, db: Session):
+async def execute_tool_nl_test_cases(tool_id, tool_nl_test_cases, tool_service: ToolService, db: Session, tool_report=True):
     """
     Method for the service to execute tool nl test cases with MCP server using agent.
 
@@ -216,25 +217,57 @@ async def execute_tool_nl_test_cases(tool_id, tool_nl_test_cases, tool_service: 
     await service.initialize()
     logger.info("MCP tool server - " + str(tool_url) + " is ready for tool validation")
 
-    tool_test_case_outputs = []
-    # we execute each nl test case and if there are any errors we add that to test case output
-    for nl_utterance in tool_nl_test_cases:
-        try:
-            #tool_output = await service.chat(message=nl_utterance)
-            # tool_output = await service.raw_stream_events(message=nl_utterance).__anext__()
-            # tool_test_case_outputs.append(langchain_dumps(tool_output))
-            all_events = []
-            async for event in service.raw_stream_events(message=nl_utterance):
-                all_events.append(langchain_dumps(event))
-            tool_test_case_outputs.append(all_events)
-        except Exception as e:
-            logger.info("Error in executing tool validation test cases with MCP server - " + str(e))
-            tool_test_case_outputs.append(str(e))
-            continue
-    with open("tool_execution.json",'w') as tef:
-        json.dump(tool_test_case_outputs,tef,indent=2)
-    tef.close()
-    return tool_test_case_outputs
+    if not tool_report:
+        tool_test_case_outputs = []
+        # we execute each nl test case and if there are any errors we add that to test case output
+        for nl_utterance in tool_nl_test_cases:
+            try:
+                tool_output = await service.chat(message=nl_utterance)
+                tool_test_case_outputs.append(tool_output)
+            except Exception as e:
+                logger.info("Error in executing tool validation test cases with MCP server - " + str(e))
+                tool_test_case_outputs.append(str(e))
+                continue
+        return tool_test_case_outputs
+    else:
+        tool_record = query_testcases_table(tool_id,db)
+        tool_test_cases = tool_record.test_cases
+        tool_test_cases_with_executions = []
+        for test_case in tool_test_cases:
+            tool_nl_test_cases = test_case.get('nl_utterance')
+            tool_execution_responses = []
+            # we execute each nl test case and if there are any errors we add that to test case output
+            for nl_utterance in tool_nl_test_cases:
+                all_events = []
+                try:
+                    thread_id = "thread_id_" + uuid.uuid4().hex
+                    config = {"configurable": {"thread_id": thread_id}}
+                    i = 0
+                    async for event in service.raw_stream_events(message=nl_utterance):
+                        turn_id = "turn_id_" + str(i + 1)
+                        turn_event = {
+                                "turn_id": turn_id,
+                                "turn_event": langchain_dumps(event),
+                            }
+                        all_events.append(turn_event)
+                        i+=1
+                except Exception as e:
+                    logger.info("Error in executing tool validation test cases with MCP server - " + str(e))
+                    tool_execution_responses.append(str(e))
+                    continue
+                tool_response = {
+                        "utterance": nl_utterance,
+                        "agentic_flow_events": all_events,
+                    }
+                tool_execution_responses.append(tool_response)
+            test_case["tool_execution_responses"] = tool_execution_responses
+            test_case["tool_name"] = mcp_cf_tool.get('name')
+            tool_test_cases_with_executions.append(test_case)
+        with open("tool_test_cases_with_execution.json",'w') as tef:
+            json.dump(tool_test_cases_with_executions,tef,indent=2)
+        tef.close()
+        return tool_test_cases_with_executions
+
 
 
 async def enrich_tool(tool_id: str, tool_service: ToolService, db: Session) -> tuple[str, ToolRead]:

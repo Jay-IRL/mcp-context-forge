@@ -1,0 +1,59 @@
+[
+  {
+    "id": "TC_1",
+    "mandatory_params": [
+      "a",
+      "b"
+    ],
+    "input": "a((number)) := 10 \nb((number)) := 20 \n",
+    "nl_utterance": [
+      "Can you add 10 and 20 together to get the sum of these two numbers?",
+      "I need to add two numbers, 10 and 20, can you do that for me?"
+    ],
+    "input_parameters": {
+      "a": [
+        10
+      ],
+      "b": [
+        20
+      ]
+    },
+    "tool_execution_responses": [
+      {
+        "utterance": "Can you add 10 and 20 together to get the sum of these two numbers?",
+        "agentic_flow_events": [
+          {
+            "turn_id": "turn_id_1",
+            "turn_event": "{\"agent\": {\"messages\": [{\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"content\": \"\", \"additional_kwargs\": {\"refusal\": null}, \"response_metadata\": {\"token_usage\": {\"completion_tokens\": 29, \"prompt_tokens\": 605, \"total_tokens\": 634, \"completion_tokens_details\": null, \"prompt_tokens_details\": null}, \"model_provider\": \"openai\", \"model_name\": \"meta-llama/llama-3-3-70b-instruct\", \"system_fingerprint\": null, \"id\": \"chatcmpl-ce31c620-c4f7-403e-9dff-89c116ca3340\", \"finish_reason\": \"tool_calls\", \"logprobs\": null}, \"type\": \"ai\", \"id\": \"lc_run--a9b5f725-3e1d-440a-874b-ef8dc106ba32-0\", \"tool_calls\": [{\"name\": \"add_numbers\", \"args\": {\"a\": \"10\", \"b\": \"20\"}, \"id\": \"chatcmpl-tool-1985f132b57142fdbd6cf4fa0c0bdbde\", \"type\": \"tool_call\"}], \"usage_metadata\": {\"input_tokens\": 605, \"output_tokens\": 29, \"total_tokens\": 634, \"input_token_details\": {}, \"output_token_details\": {}}, \"invalid_tool_calls\": []}}]}}"
+          },
+          {
+            "turn_id": "turn_id_2",
+            "turn_event": "{\"tools\": {\"messages\": [{\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"ToolMessage\"], \"kwargs\": {\"content\": \"Result: 1020\", \"type\": \"tool\", \"name\": \"add_numbers\", \"id\": \"919677cf-0a1f-4918-a3d9-e59d7d65a459\", \"tool_call_id\": \"chatcmpl-tool-1985f132b57142fdbd6cf4fa0c0bdbde\", \"status\": \"success\"}}]}}"
+          },
+          {
+            "turn_id": "turn_id_3",
+            "turn_event": "{\"agent\": {\"messages\": [{\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"content\": \"The sum of 10 and 20 is 30.\", \"additional_kwargs\": {\"refusal\": null}, \"response_metadata\": {\"token_usage\": {\"completion_tokens\": 13, \"prompt_tokens\": 648, \"total_tokens\": 661, \"completion_tokens_details\": null, \"prompt_tokens_details\": null}, \"model_provider\": \"openai\", \"model_name\": \"meta-llama/llama-3-3-70b-instruct\", \"system_fingerprint\": null, \"id\": \"chatcmpl-9ad00f86-7061-4b45-8306-4133c344308f\", \"finish_reason\": \"stop\", \"logprobs\": null}, \"type\": \"ai\", \"id\": \"lc_run--5dc6599c-cfac-4675-8734-1d6e71b3e5f3-0\", \"usage_metadata\": {\"input_tokens\": 648, \"output_tokens\": 13, \"total_tokens\": 661, \"input_token_details\": {}, \"output_token_details\": {}}, \"tool_calls\": [], \"invalid_tool_calls\": []}}]}}"
+          }
+        ]
+      },
+      {
+        "utterance": "I need to add two numbers, 10 and 20, can you do that for me?",
+        "agentic_flow_events": [
+          {
+            "turn_id": "turn_id_1",
+            "turn_event": "{\"agent\": {\"messages\": [{\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"content\": \"\", \"additional_kwargs\": {\"refusal\": null}, \"response_metadata\": {\"token_usage\": {\"completion_tokens\": 29, \"prompt_tokens\": 607, \"total_tokens\": 636, \"completion_tokens_details\": null, \"prompt_tokens_details\": null}, \"model_provider\": \"openai\", \"model_name\": \"meta-llama/llama-3-3-70b-instruct\", \"system_fingerprint\": null, \"id\": \"chatcmpl-e0d39ef7-8f76-4b92-a7e6-b754ed422b46\", \"finish_reason\": \"tool_calls\", \"logprobs\": null}, \"type\": \"ai\", \"id\": \"lc_run--917d8b92-91a1-4fbd-97f9-08d612adb50a-0\", \"tool_calls\": [{\"name\": \"add_numbers\", \"args\": {\"a\": \"10\", \"b\": \"20\"}, \"id\": \"chatcmpl-tool-8893a61a7b9c4880b3f0cb277042c7f4\", \"type\": \"tool_call\"}], \"usage_metadata\": {\"input_tokens\": 607, \"output_tokens\": 29, \"total_tokens\": 636, \"input_token_details\": {}, \"output_token_details\": {}}, \"invalid_tool_calls\": []}}]}}"
+          },
+          {
+            "turn_id": "turn_id_2",
+            "turn_event": "{\"tools\": {\"messages\": [{\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"ToolMessage\"], \"kwargs\": {\"content\": \"Result: 1020\", \"type\": \"tool\", \"name\": \"add_numbers\", \"id\": \"577aa024-e764-41cd-8bbb-04ba7b5f75d0\", \"tool_call_id\": \"chatcmpl-tool-8893a61a7b9c4880b3f0cb277042c7f4\", \"status\": \"success\"}}]}}"
+          },
+          {
+            "turn_id": "turn_id_3",
+            "turn_event": "{\"agent\": {\"messages\": [{\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"content\": \"The result of adding 10 and 20 is 30.\", \"additional_kwargs\": {\"refusal\": null}, \"response_metadata\": {\"token_usage\": {\"completion_tokens\": 14, \"prompt_tokens\": 650, \"total_tokens\": 664, \"completion_tokens_details\": null, \"prompt_tokens_details\": null}, \"model_provider\": \"openai\", \"model_name\": \"meta-llama/llama-3-3-70b-instruct\", \"system_fingerprint\": null, \"id\": \"chatcmpl-e4ca124d-eaab-4ed1-b445-fb975c634ac9\", \"finish_reason\": \"stop\", \"logprobs\": null}, \"type\": \"ai\", \"id\": \"lc_run--ba83ede2-72f6-4c63-82dd-8c3747ddad80-0\", \"usage_metadata\": {\"input_tokens\": 650, \"output_tokens\": 14, \"total_tokens\": 664, \"input_token_details\": {}, \"output_token_details\": {}}, \"tool_calls\": [], \"invalid_tool_calls\": []}}]}}"
+          }
+        ]
+      }
+    ],
+    "tool_name": "example-mcp-server-add-numbers"
+  }
+]

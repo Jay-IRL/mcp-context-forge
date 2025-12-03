@@ -110,7 +110,7 @@ def post_process_nl_test_cases(nl_test_cases):
     """
     test_cases = nl_test_cases.get("Test_scenarios")
     for tc in test_cases:
-        for un_wanted in ["scenario_type", "input"]:
+        for un_wanted in ["scenario_type"]:
             del tc[un_wanted]
     return test_cases
 
