@@ -1,25 +1,18 @@
-[
-  {
-    "id": "TC_1",
-    "mandatory_params": [
-      "a",
-      "b"
-    ],
-    "input": "a((number)) := 10 \nb((number)) := 20 \n",
-    "nl_utterance": [
-      "Can you add 10 and 20 together to get the sum of these two numbers?",
-      "I need to add two numbers, 10 and 20, can you do that for me?"
-    ],
-    "input_parameters": {
-      "a": [
-        10
+{
+  "tool_name": "example-mcp-server-add-numbers",
+  "number_of_test_cases": 2,
+  "tool_test_cases": [
+    {
+      "test_utterance": "Can you add 10 and 20 together to get the sum of these two numbers?",
+      "tool_mandatory_inputs": [
+        "a",
+        "b"
       ],
-      "b": [
-        20
-      ]
-    },
-    "tool_execution_responses": [
-      {
+      "tool_inputs": "a((number)) := 10 \nb((number)) := 20 \n",
+      "test_status": "Not Available",
+      "test_error_taxonomy": [],
+      "test_error_recommendations": [],
+      "tool_execution_events": {
         "utterance": "Can you add 10 and 20 together to get the sum of these two numbers?",
         "agentic_flow_events": [
           {
@@ -35,8 +28,19 @@
             "turn_event": "{\"agent\": {\"messages\": [{\"lc\": 1, \"type\": \"constructor\", \"id\": [\"langchain\", \"schema\", \"messages\", \"AIMessage\"], \"kwargs\": {\"content\": \"The sum of 10 and 20 is 30.\", \"additional_kwargs\": {\"refusal\": null}, \"response_metadata\": {\"token_usage\": {\"completion_tokens\": 13, \"prompt_tokens\": 648, \"total_tokens\": 661, \"completion_tokens_details\": null, \"prompt_tokens_details\": null}, \"model_provider\": \"openai\", \"model_name\": \"meta-llama/llama-3-3-70b-instruct\", \"system_fingerprint\": null, \"id\": \"chatcmpl-ec6e2186-9177-4a9d-ad47-6b8b69f7f7cd\", \"finish_reason\": \"stop\", \"logprobs\": null}, \"type\": \"ai\", \"id\": \"lc_run--795ad203-4696-4ec2-8b03-e0054d8e7e6a-0\", \"usage_metadata\": {\"input_tokens\": 648, \"output_tokens\": 13, \"total_tokens\": 661, \"input_token_details\": {}, \"output_token_details\": {}}, \"tool_calls\": [], \"invalid_tool_calls\": []}}]}}"
           }
         ]
-      },
-      {
+      }
+    },
+    {
+      "test_utterance": "I need to add two numbers, 10 and 20, can you do that for me?",
+      "tool_mandatory_inputs": [
+        "a",
+        "b"
+      ],
+      "tool_inputs": "a((number)) := 10 \nb((number)) := 20 \n",
+      "test_status": "Not Available",
+      "test_error_taxonomy": [],
+      "test_error_recommendations": [],
+      "tool_execution_events": {
         "utterance": "I need to add two numbers, 10 and 20, can you do that for me?",
         "agentic_flow_events": [
           {
@@ -53,7 +57,6 @@
           }
         ]
       }
-    ],
-    "tool_name": "example-mcp-server-add-numbers"
-  }
-]
+    }
+  ]
+}

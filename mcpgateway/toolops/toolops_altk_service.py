@@ -34,6 +34,7 @@ try:
     from altk.build_time.test_case_generation_toolkit.src.toolops.generation.test_case_generation.test_case_generation import TestcaseGeneration
     from altk.build_time.test_case_generation_toolkit.src.toolops.generation.test_case_generation.test_case_generation_utils import prompt_execution
     from altk.build_time.test_case_generation_toolkit.src.toolops.utils import llm_util
+    from altk.build_time.test_case_generation_toolkit.src.toolops.validation.tool_analysis.run_analysis import ErrorAnalysis
     from langchain_core.load.dump import dumps as langchain_dumps
 except ImportError:
     prompt_utils = None
@@ -55,6 +56,7 @@ from mcpgateway.services.tool_service import ToolService
 from mcpgateway.toolops.utils.db_util import populate_testcases_table, query_testcases_table, query_tool_auth
 from mcpgateway.toolops.utils.format_conversion import convert_to_toolops_spec, post_process_nl_test_cases
 from mcpgateway.toolops.utils.llm_util import get_llm_instance
+
 
 logging_service = LoggingService()
 logger = logging_service.get_logger(__name__)
@@ -205,6 +207,7 @@ async def execute_tool_nl_test_cases(tool_id, tool_nl_test_cases, tool_service: 
     mcp_cf_tool = tool_schema.to_dict(use_alias=True)
     tool_url = mcp_cf_tool.get("url")
     tool_auth = query_tool_auth(tool_id, db)
+    tool_name = mcp_cf_tool.get('name')
     # handling transport based on protocol type
     if "/mcp" in tool_url:
         config = MCPClientConfig(mcp_server=MCPServerConfig(url=tool_url, transport="streamable_http", headers=tool_auth), llm=TOOLOPS_LLM_CONFIG)
@@ -261,12 +264,16 @@ async def execute_tool_nl_test_cases(tool_id, tool_nl_test_cases, tool_service: 
                     }
                 tool_execution_responses.append(tool_response)
             test_case["tool_execution_responses"] = tool_execution_responses
-            test_case["tool_name"] = mcp_cf_tool.get('name')
+            test_case["tool_name"] = tool_name
             tool_test_cases_with_executions.append(test_case)
         with open("tool_test_cases_with_execution.json",'w') as tef:
             json.dump(tool_test_cases_with_executions,tef,indent=2)
         tef.close()
-        return tool_test_cases_with_executions
+        tool_report = ErrorAnalysis(tool_name,tool_test_cases_with_executions).get_tool_report()
+        with open("tool_report.json",'w') as trf:
+            json.dump(tool_report,trf,indent=2)
+        trf.close()
+        return tool_report
 
 
 

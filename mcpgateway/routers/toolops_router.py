@@ -16,7 +16,7 @@ The module handles API endpoints created for several toolops features.
 
 # Standard
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
 # Third-Party
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -104,7 +104,7 @@ async def generate_testcases_for_tool(
 
 
 @toolops_router.post("/validation/execute_tool_nl_testcases")
-async def execute_tool_nl_testcases(tool_nl_test_input: ToolNLTestInput, db: Session = Depends(get_db)) -> List:
+async def execute_tool_nl_testcases(tool_nl_test_input: ToolNLTestInput, db: Session = Depends(get_db)) -> Union[List,Dict]:
     """
     Execute test cases for a tool
 
