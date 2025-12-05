@@ -24,14 +24,25 @@ import json
 import os
 from typing import Any
 
+try:
+    # Third-Party
+    from altk.build_time.test_case_generation_toolkit.src.toolops.enrichment.mcp_cf_tool_enrichment import prompt_utils
+    from altk.build_time.test_case_generation_toolkit.src.toolops.enrichment.mcp_cf_tool_enrichment.enrichment import ToolOpsMCPCFToolEnrichment
+    from altk.build_time.test_case_generation_toolkit.src.toolops.generation.nl_utterance_generation.nl_utterance_generation import NlUtteranceGeneration
+    from altk.build_time.test_case_generation_toolkit.src.toolops.generation.nl_utterance_generation.nl_utterance_generation_utils import nlg_util
+    from altk.build_time.test_case_generation_toolkit.src.toolops.generation.test_case_generation.test_case_generation import TestcaseGeneration
+    from altk.build_time.test_case_generation_toolkit.src.toolops.generation.test_case_generation.test_case_generation_utils import prompt_execution
+    from altk.build_time.test_case_generation_toolkit.src.toolops.utils import llm_util
+except ImportError:
+    prompt_utils = None
+    ToolOpsMCPCFToolEnrichment = None
+    NlUtteranceGeneration = None
+    nlg_util = None
+    TestcaseGeneration = None
+    prompt_execution = None
+    llm_util = None
+
 # Third-Party
-from altk.build_time.test_case_generation_toolkit.src.toolops.enrichment.mcp_cf_tool_enrichment import prompt_utils
-from altk.build_time.test_case_generation_toolkit.src.toolops.enrichment.mcp_cf_tool_enrichment.enrichment import ToolOpsMCPCFToolEnrichment
-from altk.build_time.test_case_generation_toolkit.src.toolops.generation.nl_utterance_generation.nl_utterance_generation import NlUtteranceGeneration
-from altk.build_time.test_case_generation_toolkit.src.toolops.generation.nl_utterance_generation.nl_utterance_generation_utils import nlg_util
-from altk.build_time.test_case_generation_toolkit.src.toolops.generation.test_case_generation.test_case_generation import TestcaseGeneration
-from altk.build_time.test_case_generation_toolkit.src.toolops.generation.test_case_generation.test_case_generation_utils import prompt_execution
-from altk.build_time.test_case_generation_toolkit.src.toolops.utils import llm_util
 from sqlalchemy.orm import Session
 
 # First-Party
@@ -39,19 +50,21 @@ from mcpgateway.schemas import ToolRead, ToolUpdate
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.services.mcp_client_chat_service import LLMConfig, MCPChatService, MCPClientConfig, MCPServerConfig
 from mcpgateway.services.tool_service import ToolService
-from mcpgateway.toolops.utils.db_util import populate_testcases_table, query_testcases_table
+from mcpgateway.toolops.utils.db_util import populate_testcases_table, query_testcases_table, query_tool_auth
 from mcpgateway.toolops.utils.format_conversion import convert_to_toolops_spec, post_process_nl_test_cases
-from mcpgateway.toolops.utils.llm_util import completion_llm_instance, get_llm_instance
+from mcpgateway.toolops.utils.llm_util import get_llm_instance
 
-# importing toolops modules from ALTK
+logging_service = LoggingService()
+logger = logging_service.get_logger(__name__)
 
 
 toolops_llm_provider = os.getenv("LLM_PROVIDER")
 toolops_llm, toolops_llm_provider_config = get_llm_instance()
-toolops_llm_config = LLMConfig(provider=toolops_llm_provider, config=toolops_llm_provider_config)
-
-logging_service = LoggingService()
-logger = logging_service.get_logger(__name__)
+if toolops_llm is not None and toolops_llm_provider_config is not None:
+    TOOLOPS_LLM_CONFIG = LLMConfig(provider=toolops_llm_provider, config=toolops_llm_provider_config)
+else:
+    logger.error("Error in obtaining LLM instance for Toolops services")
+    TOOLOPS_LLM_CONFIG = None
 
 LLM_MODEL_ID = os.getenv("OPENAI_MODEL", "")
 provider = os.getenv("OPENAI_BASE_URL", "")
@@ -88,13 +101,11 @@ def custom_mcp_cf_execute_prompt(prompt, client=None, gen_mode=None, parameters=
     try:
         logger.info("LLM Inference call using MCP-CF LLM provider")
         # To suppress pylint errors creating dummy altk params and asserting
-        altk_dummy_params = {"client": client, "gen_mode": gen_mode, "parameters": parameters, "max_new_tokens": max_new_tokens}
-        assert altk_dummy_params is not None
-
-        if stop_sequences is None:
-            stop_sequences = ["\n\n", "<|endoftext|>"]
-        llm_response = completion_llm_instance.invoke(prompt, stop=stop_sequences)
-        response = llm_response.replace("<|eom_id|>", "").strip()
+        altk_dummy_params = {"client": client, "gen_mode": gen_mode, "parameters": parameters, "max_new_tokens": max_new_tokens, "stop_sequences": stop_sequences}
+        logger.debug(altk_dummy_params)
+        chat_llm_instance, _ = get_llm_instance(model_type="chat")
+        llm_response = chat_llm_instance.invoke(prompt)
+        response = llm_response.content
         return response
     except Exception as e:
         logger.error("Error in LLM Inference call usinf MCP-CF LLM provider - " + json.dumps({"Error": str(e)}))
@@ -102,10 +113,17 @@ def custom_mcp_cf_execute_prompt(prompt, client=None, gen_mode=None, parameters=
 
 
 # overriding methods (replace ALTK llm inferencing methods with MCP CF methods)
-llm_util.execute_prompt = custom_mcp_cf_execute_prompt
-prompt_execution.execute_prompt = custom_mcp_cf_execute_prompt
-nlg_util.execute_prompt = custom_mcp_cf_execute_prompt
-prompt_utils.execute_prompt = custom_mcp_cf_execute_prompt
+if llm_util:
+    llm_util.execute_prompt = custom_mcp_cf_execute_prompt
+
+if prompt_execution:
+    prompt_execution.execute_prompt = custom_mcp_cf_execute_prompt
+
+if nlg_util:
+    nlg_util.execute_prompt = custom_mcp_cf_execute_prompt
+
+if prompt_utils:
+    prompt_utils.execute_prompt = custom_mcp_cf_execute_prompt
 
 
 # Test case generation service method
@@ -184,11 +202,18 @@ async def execute_tool_nl_test_cases(tool_id, tool_nl_test_cases, tool_service: 
     tool_schema: ToolRead = await tool_service.get_tool(db, tool_id)
     mcp_cf_tool = tool_schema.to_dict(use_alias=True)
     tool_url = mcp_cf_tool.get("url")
-    mcp_server_url = tool_url.split("/sse")[0] + "/mcp"
-    config = MCPClientConfig(mcp_server=MCPServerConfig(url=mcp_server_url, transport="streamable_http"), llm=toolops_llm_config)
+    tool_auth = query_tool_auth(tool_id, db)
+    # handling transport based on protocol type
+    if "/mcp" in tool_url:
+        config = MCPClientConfig(mcp_server=MCPServerConfig(url=tool_url, transport="streamable_http", headers=tool_auth), llm=TOOLOPS_LLM_CONFIG)
+    elif "/sse" in tool_url:
+        config = MCPClientConfig(mcp_server=MCPServerConfig(url=tool_url, transport="sse", headers=tool_auth), llm=TOOLOPS_LLM_CONFIG)
+    else:
+        config = MCPClientConfig(mcp_server=MCPServerConfig(url=tool_url, transport="stdio", headers=tool_auth), llm=TOOLOPS_LLM_CONFIG)
+
     service = MCPChatService(config)
     await service.initialize()
-    logger.info("MCP tool server - " + str(mcp_server_url) + " is ready for tool validation")
+    logger.info("MCP tool server - " + str(tool_url) + " is ready for tool validation")
 
     tool_test_case_outputs = []
     # we execute each nl test case and if there are any errors we add that to test case output
@@ -249,18 +274,18 @@ async def enrich_tool(tool_id: str, tool_service: ToolService, db: Session) -> t
 #     from mcpgateway.db import SessionLocal
 #     from mcpgateway.services.tool_service import ToolService
 
-#     tool_id = "ccf65855a34e403f97c8d801bee1906f"
+#     tool_id = "69df98bcab6b4895a0345a20aeb038b2"
 #     tool_service = ToolService()
 #     db = SessionLocal()
-#     tool_test_cases = asyncio.run(validation_generate_test_cases(tool_id, tool_service, db, number_of_test_cases=2, number_of_nl_variations=2, mode="generate"))
-#     print("#" * 30)
-#     print("tool_test_cases")
-#     print(tool_test_cases)
-#     enrich_output = asyncio.run(enrich_tool(tool_id, tool_service, db))
-#     print("#" * 30)
-#     print("enrich_output")
-#     print(enrich_output)
-#     tool_nl_test_cases = ["get all actions", "get salesloft actions", "I need salesloft all actions"]
+#     # tool_test_cases = asyncio.run(validation_generate_test_cases(tool_id, tool_service, db, number_of_test_cases=2, number_of_nl_variations=2, mode="generate"))
+#     # print("#" * 30)
+#     # print("tool_test_cases")
+#     # print(tool_test_cases)
+#     # enrich_output = asyncio.run(enrich_tool(tool_id, tool_service, db))
+#     # print("#" * 30)
+#     # print("enrich_output")
+#     # print(enrich_output)
+#     tool_nl_test_cases = ["add 3 and 10","please add 4 and 6"]
 #     tool_outputs = asyncio.run(execute_tool_nl_test_cases(tool_id, tool_nl_test_cases, tool_service, db))
 #     print("#" * 30)
 #     print("len - tool_outputs", len(tool_outputs))
