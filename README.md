@@ -84,8 +84,10 @@ ContextForge MCP Gateway is a feature-rich gateway, proxy and MCP Registry that 
     * 10.16. [Health Checks](#health-checks)
     * 10.17. [Database](#database)
     * 10.18. [Cache Backend](#cache-backend)
-    * 10.19. [Plugin Configuration](#plugin-configuration)
-    * 10.20. [Development](#development)
+    * 10.19. [Tool Lookup Cache](#tool-lookup-cache)
+    * 10.20. [Metrics Aggregation Cache](#metrics-aggregation-cache)
+    * 10.21. [Plugin Configuration](#plugin-configuration)
+    * 10.22. [Development](#development)
 * 11. [Running](#running)
     * 11.1. [Makefile](#makefile)
     * 11.2. [Script helper](#script-helper)
@@ -153,15 +155,6 @@ For a list of upcoming features, check out the [ContextForge Roadmap](https://ib
 * Sits in front of any MCP server or REST API
 * Lets you choose your MCP protocol version (e.g., `2025-03-26`)
 * Exposes a single, unified interface for diverse backends
-
-</details>
-
-<details>
-<summary><strong>🌐 Federation of Peer Gateways (MCP Registry)</strong></summary>
-
-* Auto-discovers or configures peer gateways (via mDNS or manual)
-* Performs health checks and merges remote registries transparently
-* Supports Redis-backed syncing and fail-over
 
 </details>
 
@@ -342,6 +335,21 @@ curl -s -H "Authorization: Bearer $Env:MCPGATEWAY_BEARER_TOKEN" `
      http://127.0.0.1:4444/version | jq
 ```
 
+<details>
+<summary><strong>⚡ Alternative: uv (faster)</strong></summary>
+
+```powershell
+# 1️⃣  Isolated env + install from PyPI using uv
+mkdir mcpgateway ; cd mcpgateway
+uv venv
+.\.venv\Scripts\activate
+uv pip install mcp-contextforge-gateway
+
+# Continue with steps 2️⃣-4️⃣ above...
+```
+
+</details>
+
 </details>
 
 <details>
@@ -463,7 +471,7 @@ When using a MCP Client such as Claude with stdio:
 ## Quick Start - Containers
 
 Use the official OCI image from GHCR with **Docker** *or* **Podman**.
-Please note: Currently, arm64 is not supported. If you are e.g. running on MacOS, install via PyPi.
+Please note: Currently, arm64 is not supported on production. If you are e.g. running on MacOS with Apple Silicon chips (M1, M2, etc), you can run the containers using Rosetta or install via PyPi instead.
 
 ### 🚀 Quick Start - Docker Compose
 
@@ -569,7 +577,7 @@ docker run -d --name mcpgateway \
   -e PLATFORM_ADMIN_FULL_NAME="Platform Administrator" \
   -e DATABASE_URL=sqlite:///./mcp.db \
   -e SECURE_COOKIES=false \
-  ghcr.io/ibm/mcp-context-forge:0.9.0
+  ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
 
 # Note: when not running over SSL, use SECURE_COOKIES=false to prevent the browser denying access.
 
@@ -577,7 +585,7 @@ docker run -d --name mcpgateway \
 docker logs -f mcpgateway
 
 # Generating an API key
-docker run --rm -it ghcr.io/ibm/mcp-context-forge:0.9.0 \
+docker run --rm -it ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1 \
   python3 -m mcpgateway.utils.create_jwt_token --username admin@example.com --exp 0 --secret my-test-key
 ```
 
@@ -608,7 +616,7 @@ docker run -d --name mcpgateway \
   -e PLATFORM_ADMIN_EMAIL=admin@example.com \
   -e PLATFORM_ADMIN_PASSWORD=changeme \
   -e PLATFORM_ADMIN_FULL_NAME="Platform Administrator" \
-  ghcr.io/ibm/mcp-context-forge:0.9.0
+  ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
 ```
 
 SQLite now lives on the host at `./data/mcp.db`.
@@ -635,7 +643,7 @@ docker run -d --name mcpgateway \
   -e PLATFORM_ADMIN_PASSWORD=changeme \
   -e PLATFORM_ADMIN_FULL_NAME="Platform Administrator" \
   -v $(pwd)/data:/data \
-  ghcr.io/ibm/mcp-context-forge:0.9.0
+  ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
 ```
 
 Using `--network=host` allows Docker to access the local network, allowing you to add MCP servers running on your host. See [Docker Host network driver documentation](https://docs.docker.com/engine/network/drivers/host/) for more details.
@@ -676,7 +684,7 @@ podman run -d --name mcpgateway \
   -p 4444:4444 \
   -e HOST=0.0.0.0 \
   -e DATABASE_URL=sqlite:///./mcp.db \
-  ghcr.io/ibm/mcp-context-forge:0.9.0
+  ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
 ```
 
 #### 2 - Persist SQLite
@@ -695,7 +703,7 @@ podman run -d --name mcpgateway \
   -p 4444:4444 \
   -v $(pwd)/data:/data \
   -e DATABASE_URL=sqlite:////data/mcp.db \
-  ghcr.io/ibm/mcp-context-forge:0.9.0
+  ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
 ```
 
 #### 3 - Host networking (rootless)
@@ -713,7 +721,7 @@ podman run -d --name mcpgateway \
   --network=host \
   -v $(pwd)/data:/data \
   -e DATABASE_URL=sqlite:////data/mcp.db \
-  ghcr.io/ibm/mcp-context-forge:0.9.0
+  ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
 ```
 
 ---
@@ -768,7 +776,7 @@ docker run --rm -i \
   -e MCP_SERVER_URL=http://host.docker.internal:4444/servers/UUID_OF_SERVER_1/mcp \
   -e MCP_TOOL_CALL_TIMEOUT=120 \
   -e MCP_WRAPPER_LOG_LEVEL=DEBUG \
-  ghcr.io/ibm/mcp-context-forge:0.9.0 \
+  ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1 \
   python3 -m mcpgateway.wrapper
 ```
 
@@ -850,7 +858,7 @@ docker run -i --rm \
   -e MCP_SERVER_URL=http://localhost:4444/servers/UUID_OF_SERVER_1/mcp \
   -e MCP_AUTH=${MCP_AUTH} \
   -e MCP_TOOL_CALL_TIMEOUT=120 \
-  ghcr.io/ibm/mcp-context-forge:0.9.0 \
+  ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1 \
   python3 -m mcpgateway.wrapper
 ```
 
@@ -1127,12 +1135,32 @@ pip install -e ".[dev]"
 
 You can configure the gateway with SQLite, PostgreSQL (or any other compatible database) in .env.
 
-When using PostgreSQL, you need to install `psycopg2` driver.
+When using PostgreSQL, you need to install the `psycopg` (psycopg3) driver.
+
+**System Dependencies**: The PostgreSQL adapter requires the `libpq` development headers to compile:
 
 ```bash
-uv pip install psycopg2-binary   # dev convenience
+# Debian/Ubuntu
+sudo apt-get install libpq-dev
+
+# RHEL/CentOS/Fedora
+sudo dnf install postgresql-devel
+
+# macOS (Homebrew)
+brew install libpq
+```
+
+Then install the Python package:
+
+```bash
+uv pip install 'psycopg[binary]'   # dev convenience (pre-built wheels)
 # or
-uv pip install psycopg2          # production build
+uv pip install 'psycopg[c]'        # production build (requires compiler)
+```
+
+Connection URL format (must use `+psycopg` for psycopg3):
+```bash
+DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/mcp
 ```
 
 #### Quick Postgres container
@@ -1227,13 +1255,22 @@ You can get started by copying the provided [.env.example](https://github.com/IB
 | `JWT_PRIVATE_KEY_PATH`      | If an asymmetric algorithm is used, a private key is required                | (empty)             | path to pem |
 | `JWT_AUDIENCE`              | JWT audience claim for token validation                                      | `mcpgateway-api`    | string      |
 | `JWT_AUDIENCE_VERIFICATION` | Disables jwt audience verification (useful for DCR)                          | `true`              | boolean     |
+| `JWT_ISSUER_VERIFICATION`   | Disables jwt issuer verification (useful for custom auth)                    | `true`              | boolean     |
 | `JWT_ISSUER`                | JWT issuer claim for token validation                                        | `mcpgateway`        | string      |
 | `TOKEN_EXPIRY`              | Expiry of generated JWTs in minutes                                          | `10080`             | int > 0     |
 | `REQUIRE_TOKEN_EXPIRATION`  | Require all JWT tokens to have expiration claims                             | `false`             | bool        |
+| `REQUIRE_JTI`               | Require JTI (JWT ID) claim in all tokens for revocation support              | `false`             | bool        |
+| `REQUIRE_USER_IN_DB`        | Require all authenticated users to exist in the database                     | `false`             | bool        |
+| `EMBED_ENVIRONMENT_IN_TOKENS` | Embed environment claim in gateway-issued JWTs                             | `false`             | bool        |
+| `VALIDATE_TOKEN_ENVIRONMENT` | Reject tokens with mismatched environment claim                             | `false`             | bool        |
 | `AUTH_ENCRYPTION_SECRET`    | Passphrase used to derive AES key for encrypting tool auth headers           | `my-test-salt`      | string      |
 | `OAUTH_REQUEST_TIMEOUT`     | OAuth request timeout in seconds                                             | `30`                | int > 0     |
 | `OAUTH_MAX_RETRIES`         | Maximum retries for OAuth token requests                                     | `3`                 | int > 0     |
 | `OAUTH_DEFAULT_TIMEOUT`         | Default OAuth token timeout in seconds                                     | `3600`                 | int > 0     |
+| `INSECURE_ALLOW_QUERYPARAM_AUTH` | Enable query parameter authentication for gateways (see security warning) | `false`             | bool        |
+| `INSECURE_QUERYPARAM_AUTH_ALLOWED_HOSTS` | JSON array of hosts allowed to use query param auth               | `[]`                | JSON array  |
+
+> ⚠️ **Query Parameter Authentication (INSECURE)**: The `INSECURE_ALLOW_QUERYPARAM_AUTH` setting enables API key authentication via URL query parameters. This is inherently insecure (CWE-598) as API keys may appear in proxy logs, browser history, and server access logs. Only enable this when the upstream MCP server (e.g., Tavily) requires this authentication method. Always configure `INSECURE_QUERYPARAM_AUTH_ALLOWED_HOSTS` to restrict which hosts can use this feature.
 
 > 🔐 `BASIC_AUTH_USER`/`PASSWORD` are used for:
 >
@@ -1408,6 +1445,51 @@ The LLM Chat MCP Client allows you to interact with MCP servers using conversati
 **Documentation:**
 - [LLM Chat Guide](https://ibm.github.io/mcp-context-forge/using/clients/llm-chat) - Complete LLM Chat setup and provider configuration
 
+### LLM Settings (Internal API)
+
+The LLM Settings feature enables MCP Gateway to act as a unified LLM provider with an OpenAI-compatible API. Configure multiple external LLM providers through the Admin UI and expose them through a single proxy endpoint.
+
+| Setting                        | Description                            | Default | Options |
+| ------------------------------ | -------------------------------------- | ------- | ------- |
+| `LLM_API_PREFIX`              | API prefix for internal LLM endpoints  | `/v1`   | string  |
+| `LLM_REQUEST_TIMEOUT`         | Request timeout for LLM API calls (seconds) | `120` | int     |
+| `LLM_STREAMING_ENABLED`       | Enable streaming responses             | `true`  | bool    |
+| `LLM_HEALTH_CHECK_INTERVAL`   | Provider health check interval (seconds) | `300` | int     |
+
+**Gateway Provider Settings (for LLM Chat with provider=gateway):**
+
+| Setting                        | Description                            | Default | Options |
+| ------------------------------ | -------------------------------------- | ------- | ------- |
+| `GATEWAY_MODEL`               | Default model to use                   | `gpt-4o` | string |
+| `GATEWAY_BASE_URL`            | Base URL for gateway LLM API           | (auto)  | string  |
+| `GATEWAY_TEMPERATURE`         | Sampling temperature                   | `0.7`   | float   |
+
+**Features:**
+
+- **OpenAI-Compatible API**: Exposes `/v1/chat/completions` and `/v1/models` endpoints compatible with any OpenAI client
+- **Multi-Provider Support**: Configure OpenAI, Azure OpenAI, Anthropic, Ollama, Google, Mistral, Cohere, AWS Bedrock, Groq, and more
+- **Admin UI Management**: Add, edit, enable/disable, and test providers through the Admin UI (LLM Settings tab)
+- **Model Discovery**: Fetch available models from providers and sync them to the database
+- **Health Monitoring**: Automatic health checks with status indicators
+- **Unified Interface**: Route requests to any configured provider through a single API
+
+**API Endpoints:**
+
+```bash
+# List available models
+curl -H "Authorization: Bearer $TOKEN" http://localhost:4444/v1/models
+
+# Chat completion
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4o", "messages": [{"role": "user", "content": "Hello"}]}' \
+  http://localhost:4444/v1/chat/completions
+```
+
+> 🔧 **Configuration**: Providers are managed through the Admin UI under "LLM Settings > Providers"
+> 📋 **Models**: View and manage models under "LLM Settings > Models"
+> ⚡ **Testing**: Test models directly from the Admin UI with the "Test" feature
+
 ### Email-Based Authentication & User Management
 
 | Setting                        | Description                                      | Default               | Options |
@@ -1432,10 +1514,15 @@ The LLM Chat MCP Client allows you to interact with MCP servers using conversati
 | Setting                        | Description                                      | Default               | Options |
 | ------------------------------ | ------------------------------------------------ | --------------------- | ------- |
 | `MCP_CLIENT_AUTH_ENABLED`     | Enable JWT authentication for MCP client operations | `true`            | bool    |
+| `MCP_REQUIRE_AUTH`            | Require authentication for /mcp endpoints. If false, unauthenticated requests can access public items only | `false` | bool |
 | `TRUST_PROXY_AUTH`            | Trust proxy authentication headers               | `false`               | bool    |
 | `PROXY_USER_HEADER`           | Header containing authenticated username from proxy | `X-Authenticated-User` | string |
 
 > 🔐 **MCP Client Auth**: When `MCP_CLIENT_AUTH_ENABLED=false`, you must set `TRUST_PROXY_AUTH=true` if using a trusted authentication proxy. This is a security-sensitive setting.
+
+> 🔒 **MCP Require Auth**: When `MCP_REQUIRE_AUTH=true`, all `/mcp` endpoint requests must include a valid Bearer token. When `false` (default), unauthenticated requests are allowed but can only access public tools, resources, and prompts.
+
+> ⚠️ **MCP Access Control Dependencies**: Full MCP access control (visibility + team scoping + membership validation) requires `MCP_CLIENT_AUTH_ENABLED=true` with valid JWT tokens containing team claims. When `MCP_CLIENT_AUTH_ENABLED=false`, access control relies on `MCP_REQUIRE_AUTH` plus tool/resource visibility only—team membership validation is skipped since there's no JWT to extract teams from.
 
 ### SSO (Single Sign-On) Configuration
 
@@ -1545,6 +1632,7 @@ ContextForge implements **OAuth 2.0 Dynamic Client Registration (RFC 7591)** and
 | `OAUTH_DISCOVERY_ENABLED`                  | Enable AS metadata discovery (RFC 8414)                        | `true`                         | bool          |
 | `OAUTH_PREFERRED_CODE_CHALLENGE_METHOD`    | PKCE code challenge method                                     | `S256`                         | `S256`, `plain` |
 | `JWT_AUDIENCE_VERIFICATION`                | JWT audience verification (disable for DCR)                    | `true`                         | bool          |
+| `JWT_ISSUER_VERIFICATION`                  | JWT issuer verification (disable if needed)                    | `true`                         | bool          |
 
 **Documentation:**
 - [DCR Configuration Guide](https://ibm.github.io/mcp-context-forge/manage/dcr/) - Complete DCR setup and troubleshooting
@@ -1619,7 +1707,7 @@ ContextForge implements **OAuth 2.0 Dynamic Client Registration (RFC 7591)** and
 >
 > **iframe Embedding**: The gateway controls iframe embedding through both `X-Frame-Options` header and CSP `frame-ancestors` directive (both are automatically synced). Options:
 > - `X_FRAME_OPTIONS=DENY` (default): Blocks all iframe embedding
-> - `X_FRAME_OPTIONS=SAMEORIGIN`: Allows embedding from same domain only  
+> - `X_FRAME_OPTIONS=SAMEORIGIN`: Allows embedding from same domain only
 > - `X_FRAME_OPTIONS="ALLOW-ALL"`: Allows embedding from all sources (sets `frame-ancestors * file: http: https:`)
 > - `X_FRAME_OPTIONS=null` or `none`: Completely removes iframe restrictions (no headers sent)
 >
@@ -1765,6 +1853,8 @@ MCP Gateway provides flexible logging with **stdout/stderr output by default** a
 | ----------------------- | ---------------------------------- | ----------------- | -------------------------- |
 | `LOG_LEVEL`             | Minimum log level                  | `INFO`            | `DEBUG`...`CRITICAL`       |
 | `LOG_FORMAT`            | Console log format                 | `json`            | `json`, `text`             |
+| `LOG_REQUESTS`          | Enable detailed request logging    | `false`           | `true`, `false`            |
+| `LOG_DETAILED_MAX_BODY_SIZE` | Max request body size to log (bytes) | `16384`       | `1024` - `1048576`         |
 | `LOG_TO_FILE`           | **Enable file logging**            | **`false`**       | **`true`, `false`**        |
 | `LOG_FILE`              | Log filename (when enabled)        | `null`            | `mcpgateway.log`           |
 | `LOG_FOLDER`            | Directory for log files            | `null`            | `logs`, `/var/log/gateway` |
@@ -1780,6 +1870,7 @@ MCP Gateway provides flexible logging with **stdout/stderr output by default** a
 - **Log Rotation**: When `LOG_ROTATION_ENABLED=true`, files rotate at `LOG_MAX_SIZE_MB` with `LOG_BACKUP_COUNT` backup files (e.g., `.log.1`, `.log.2`)
 - **Directory Creation**: Log folder is automatically created if it doesn't exist
 - **Centralized Service**: All modules use the unified `LoggingService` for consistent formatting
+- **Detailed Request Logging**: When `LOG_REQUESTS=true`, payload logging is truncated to `LOG_DETAILED_MAX_BODY_SIZE` and skipped for `/health`, `/healthz`, `/static`, and `/favicon.ico`
 
 **Example Configurations:**
 
@@ -1801,6 +1892,10 @@ LOG_MAX_SIZE_MB=10
 LOG_BACKUP_COUNT=3
 LOG_FOLDER=/var/log/mcpgateway
 LOG_FILE=gateway.log
+
+# Optional: Enable detailed request payload logging (truncated)
+LOG_REQUESTS=true
+LOG_DETAILED_MAX_BODY_SIZE=16384
 ```
 
 **Default Behavior:**
@@ -1814,7 +1909,7 @@ MCP Gateway includes **vendor-agnostic OpenTelemetry support** for distributed t
 
 | Setting                         | Description                                    | Default               | Options                                    |
 | ------------------------------- | ---------------------------------------------- | --------------------- | ------------------------------------------ |
-| `OTEL_ENABLE_OBSERVABILITY`     | Master switch for observability               | `true`                | `true`, `false`                           |
+| `OTEL_ENABLE_OBSERVABILITY`     | Master switch for observability               | `false`               | `true`, `false`                           |
 | `OTEL_SERVICE_NAME`             | Service identifier in traces                   | `mcp-gateway`         | string                                     |
 | `OTEL_SERVICE_VERSION`          | Service version in traces                      | `0.9.0`               | string                                     |
 | `OTEL_DEPLOYMENT_ENVIRONMENT`   | Environment tag (dev/staging/prod)            | `development`         | string                                     |
@@ -1878,7 +1973,8 @@ The gateway includes built-in observability features for tracking HTTP requests,
 | `OBSERVABILITY_TRACE_RETENTION_DAYS` | Number of days to retain trace data                   | `7`                                                  | int (≥ 1)        |
 | `OBSERVABILITY_MAX_TRACES`           | Maximum number of traces to retain                    | `100000`                                             | int (≥ 1000)     |
 | `OBSERVABILITY_SAMPLE_RATE`          | Trace sampling rate (0.0-1.0)                        | `1.0`                                                | float (0.0-1.0)  |
-| `OBSERVABILITY_EXCLUDE_PATHS`        | Paths to exclude from tracing (regex patterns)        | `/health,/healthz,/ready,/metrics,/static/.*`        | comma-separated  |
+| `OBSERVABILITY_INCLUDE_PATHS`        | Regex patterns to include for tracing                | `["^/rpc/?$","^/sse$","^/message$","^/mcp(?:/|$)","^/servers/[^/]+/mcp/?$","^/servers/[^/]+/sse$","^/servers/[^/]+/message$","^/a2a(?:/|$)"]` | JSON array |
+| `OBSERVABILITY_EXCLUDE_PATHS`        | Regex patterns to exclude (after include patterns)   | `["/health","/healthz","/ready","/metrics","/static/.*"]` | JSON array |
 | `OBSERVABILITY_METRICS_ENABLED`      | Enable metrics collection                             | `true`                                               | bool             |
 | `OBSERVABILITY_EVENTS_ENABLED`       | Enable event logging within spans                     | `true`                                               | bool             |
 
@@ -1887,12 +1983,14 @@ The gateway includes built-in observability features for tracking HTTP requests,
 - 🔍 **Admin UI integration**: View traces, spans, and metrics in the diagnostics tab
 - 🎯 **Sampling control**: Configure sampling rate to reduce overhead in high-traffic scenarios
 - 🕐 **Automatic cleanup**: Old traces automatically purged based on retention settings
-- 🚫 **Path filtering**: Exclude health checks and static resources from tracing
+- 🚫 **Path filtering**: Only include-listed endpoints are traced by default (MCP/A2A); regex excludes apply after includes
 
 **Configuration Effects:**
 - `OBSERVABILITY_ENABLED=false`: Completely disables internal observability (no database writes, zero overhead)
 - `OBSERVABILITY_SAMPLE_RATE=0.1`: Traces 10% of requests (useful for high-volume production)
-- `OBSERVABILITY_EXCLUDE_PATHS=/health,/metrics`: Prevents noisy endpoints from creating traces
+- `OBSERVABILITY_INCLUDE_PATHS=["^/mcp(?:/|$)","^/a2a(?:/|$)"]`: Limits tracing to MCP and A2A endpoints
+- `OBSERVABILITY_INCLUDE_PATHS=[]`: Traces all endpoints (still subject to exclude patterns)
+- `OBSERVABILITY_EXCLUDE_PATHS=["/health","/metrics"]`: Prevents noisy endpoints from creating traces
 
 > 📝 **Note**: This is separate from OpenTelemetry. You can use both systems simultaneously - internal observability for Admin UI visibility and OpenTelemetry for external systems like Phoenix/Jaeger.
 >
@@ -1942,6 +2040,39 @@ ENABLE_METRICS=false
 >
 > 🎯 **Grafana Integration**: Import metrics into Grafana dashboards using the configured namespace as a filter
 
+### Metrics Cleanup & Rollup
+
+Automatic management of metrics data to prevent unbounded table growth and maintain query performance.
+
+| Setting                              | Description                                      | Default  | Options     |
+| ------------------------------------ | ------------------------------------------------ | -------- | ----------- |
+| `DB_METRICS_RECORDING_ENABLED`       | Enable execution metrics recording (tool/resource/prompt/server/A2A) | `true` | bool |
+| `METRICS_CLEANUP_ENABLED`            | Enable automatic cleanup of old metrics          | `true`   | bool        |
+| `METRICS_RETENTION_DAYS`             | Days to retain raw metrics (fallback)            | `7`      | 1-365       |
+| `METRICS_CLEANUP_INTERVAL_HOURS`     | Hours between automatic cleanup runs             | `1`      | 1-168       |
+| `METRICS_CLEANUP_BATCH_SIZE`         | Batch size for deletion (prevents long locks)    | `10000`  | 100-100000  |
+| `METRICS_ROLLUP_ENABLED`             | Enable hourly metrics rollup                     | `true`   | bool        |
+| `METRICS_ROLLUP_INTERVAL_HOURS`      | Hours between rollup runs                        | `1`      | 1-24        |
+| `METRICS_ROLLUP_RETENTION_DAYS`      | Days to retain hourly rollup data                | `365`    | 30-3650     |
+| `METRICS_ROLLUP_LATE_DATA_HOURS`     | Hours to re-process for late-arriving data       | `1`      | 1-48        |
+| `METRICS_DELETE_RAW_AFTER_ROLLUP`    | Delete raw metrics after rollup exists           | `true`   | bool        |
+| `METRICS_DELETE_RAW_AFTER_ROLLUP_HOURS` | Hours to retain raw when rollup exists        | `1`      | 1-8760      |
+| `USE_POSTGRESDB_PERCENTILES`         | Use PostgreSQL-native percentile_cont for p50/p95/p99 | `true` | bool     |
+| `YIELD_BATCH_SIZE`                   | Rows per batch when streaming rollup queries     | `1000`   | 100-10000   |
+
+**Key Features:**
+- 📊 **Hourly rollup**: Pre-aggregated summaries with p50/p95/p99 percentiles
+- 🗑️ **Batched cleanup**: Prevents long table locks during deletion
+- 📈 **Admin API**: Manual triggers at `/api/metrics/cleanup` and `/api/metrics/rollup`
+- ⚙️ **Configurable retention**: Separate retention for raw and rollup data
+
+**Deletion behavior:**
+- Deleted tools/resources/prompts/servers are removed from Top Performers by default, but historical rollups remain for reporting.
+- To permanently erase metrics for a deleted entity, use the Admin UI delete prompt and choose **Purge metrics**, or call the delete endpoints with `?purge_metrics=true`.
+- Purge deletes use batched deletes sized by `METRICS_CLEANUP_BATCH_SIZE` to reduce long table locks on large datasets.
+
+> 🚀 **Performance**: Reduces storage by 90%+ and query latency from seconds to milliseconds for historical data
+
 ### Transport
 
 | Setting                   | Description                        | Default | Options                         |
@@ -1960,11 +2091,7 @@ ENABLE_METRICS=false
 
 | Setting                    | Description            | Default | Options    |
 | -------------------------- | ---------------------- | ------- | ---------- |
-| `FEDERATION_ENABLED`       | Enable federation      | `true`  | bool       |
-| `FEDERATION_DISCOVERY`     | Auto-discover peers    | `false` | bool       |
-| `FEDERATION_PEERS`         | Comma-sep peer URLs    | `[]`    | JSON array |
 | `FEDERATION_TIMEOUT`       | Gateway timeout (secs) | `30`    | int > 0    |
-| `FEDERATION_SYNC_INTERVAL` | Sync interval (secs)   | `300`   | int > 0    |
 
 ### Resources
 
@@ -1998,11 +2125,13 @@ ENABLE_METRICS=false
 | Setting                 | Description                               | Default | Options |
 | ----------------------- | ----------------------------------------- | ------- | ------- |
 | `HEALTH_CHECK_INTERVAL` | Health poll interval (secs)               | `60`    | int > 0 |
-| `HEALTH_CHECK_TIMEOUT`  | Health request timeout (secs)             | `10`    | int > 0 |
+| `HEALTH_CHECK_TIMEOUT`  | Health request timeout (secs)             | `5`     | int > 0 |
+| `GATEWAY_HEALTH_CHECK_TIMEOUT` | Per-check timeout for gateway health check (secs) | `5.0` | float > 0 |
 | `UNHEALTHY_THRESHOLD`   | Fail-count before peer deactivation,      | `3`     | int > 0 |
 |                         | Set to -1 if deactivation is not needed.  |         |         |
 | `GATEWAY_VALIDATION_TIMEOUT` | Gateway URL validation timeout (secs) | `5`     | int > 0 |
 | `MAX_CONCURRENT_HEALTH_CHECKS` | Max Concurrent health checks        | `20`     | int > 0 |
+| `AUTO_REFRESH_SERVERS` | Auto Refresh tools/prompts/resources        | `false`     | bool |
 | `FILELOCK_NAME`         | File lock for leader election             | `gateway_service_leader.lock` | string |
 | `DEFAULT_ROOTS`         | Default root paths for resources          | `[]`    | JSON array |
 
@@ -2014,8 +2143,8 @@ ENABLE_METRICS=false
 | `DB_MAX_OVERFLOW`.      | Extra connections beyond pool   | `10`    | int ≥ 0 |
 | `DB_POOL_TIMEOUT`.      | Wait for connection (secs)      | `30`    | int > 0 |
 | `DB_POOL_RECYCLE`.      | Recycle connections (secs)      | `3600`  | int > 0 |
-| `DB_MAX_RETRIES` .      | Max Retry Attempts              | `3`     | int > 0 |
-| `DB_RETRY_INTERVAL_MS`  | Retry Interval (ms)             | `2000`  | int > 0 |
+| `DB_MAX_RETRIES` .      | Max retry attempts at startup (exponential backoff) | `30`    | int > 0 |
+| `DB_RETRY_INTERVAL_MS`  | Base retry interval (ms), doubles each attempt up to 30s | `2000`  | int > 0 |
 
 ### Cache Backend
 
@@ -2026,10 +2155,62 @@ ENABLE_METRICS=false
 | `CACHE_PREFIX`            | Key prefix                 | `mcpgw:` | string                   |
 | `SESSION_TTL`             | Session validity (secs)    | `3600`   | int > 0                  |
 | `MESSAGE_TTL`             | Message retention (secs)   | `600`    | int > 0                  |
-| `REDIS_MAX_RETRIES`       | Max Retry Attempts         | `3`      | int > 0                  |
-| `REDIS_RETRY_INTERVAL_MS` | Retry Interval (ms)        | `2000`   | int > 0                  |
+| `REDIS_MAX_RETRIES`       | Max retry attempts at startup (exponential backoff) | `30`     | int > 0                  |
+| `REDIS_RETRY_INTERVAL_MS` | Base retry interval (ms), doubles each attempt up to 30s | `2000`   | int > 0                  |
+| `REDIS_MAX_CONNECTIONS`   | Connection pool size       | `50`     | int > 0                  |
+| `REDIS_SOCKET_TIMEOUT`    | Socket timeout (secs)      | `2.0`    | float > 0                |
+| `REDIS_SOCKET_CONNECT_TIMEOUT` | Connect timeout (secs) | `2.0`   | float > 0                |
+| `REDIS_RETRY_ON_TIMEOUT`  | Retry on timeout           | `true`   | bool                     |
+| `REDIS_HEALTH_CHECK_INTERVAL` | Health check (secs)    | `30`     | int >= 0                 |
+| `REDIS_DECODE_RESPONSES`  | Return strings vs bytes    | `true`   | bool                     |
+| `REDIS_LEADER_TTL`        | Leader election TTL (secs) | `15`     | int > 0                  |
+| `REDIS_LEADER_KEY`        | Leader key name            | `gateway_service_leader` | string |
+| `REDIS_LEADER_HEARTBEAT_INTERVAL` | Heartbeat (secs)   | `5`      | int > 0                  |
 
 > 🧠 `none` disables caching entirely. Use `memory` for dev, `database` for local persistence, or `redis` for distributed caching across multiple instances.
+
+### Tool Lookup Cache
+
+| Setting                               | Description                                                     | Default | Options          |
+| ------------------------------------- | --------------------------------------------------------------- | ------- | ---------------- |
+| `TOOL_LOOKUP_CACHE_ENABLED`           | Enable tool lookup cache for `invoke_tool` hot path             | `true`  | bool             |
+| `TOOL_LOOKUP_CACHE_TTL_SECONDS`       | Cache TTL (seconds) for tool lookup entries                     | `60`    | int (5-600)      |
+| `TOOL_LOOKUP_CACHE_NEGATIVE_TTL_SECONDS` | Cache TTL (seconds) for missing/inactive/offline entries     | `10`    | int (1-60)       |
+| `TOOL_LOOKUP_CACHE_L1_MAXSIZE`        | Max entries in in-memory L1 cache                               | `10000` | int (100-1000000) |
+| `TOOL_LOOKUP_CACHE_L2_ENABLED`        | Enable Redis-backed L2 cache when `CACHE_TYPE=redis`            | `true`  | bool             |
+
+> ⚡ **Performance**: Eliminates a DB lookup per tool invocation. L1 is always available; L2 activates when `CACHE_TYPE=redis` and `TOOL_LOOKUP_CACHE_L2_ENABLED=true`.
+
+### Metrics Aggregation Cache
+
+| Setting                     | Description                           | Default | Options    |
+| --------------------------- | ------------------------------------- | ------- | ---------- |
+| `METRICS_CACHE_ENABLED`     | Enable metrics query caching          | `true`  | bool       |
+| `METRICS_CACHE_TTL_SECONDS` | Cache TTL (seconds)                   | `60`    | int (1-300)|
+
+> ⚡ **Performance**: Caches aggregate metrics queries to reduce full table scans. Under high load (3000+ users), setting TTL to 60-120 seconds can reduce database scans by 6-12×. See [Issue #1906](https://github.com/IBM/mcp-context-forge/issues/1906).
+
+### MCP Session Pool
+
+| Setting                                   | Description                                        | Default | Options     |
+| ----------------------------------------- | -------------------------------------------------- | ------- | ----------- |
+| `MCP_SESSION_POOL_ENABLED`                | Enable session pooling (10-20x latency improvement)| `false` | bool        |
+| `MCP_SESSION_POOL_MAX_PER_KEY`            | Max sessions per (URL, identity, transport)        | `10`    | int (1-100) |
+| `MCP_SESSION_POOL_TTL`                    | Session TTL before forced close (seconds)          | `300`   | float       |
+| `MCP_SESSION_POOL_TRANSPORT_TIMEOUT`      | Timeout for all HTTP operations (seconds)          | `30`    | float       |
+| `MCP_SESSION_POOL_HEALTH_CHECK_INTERVAL`  | Idle time before health check (seconds)            | `60`    | float       |
+| `MCP_SESSION_POOL_ACQUIRE_TIMEOUT`        | Timeout waiting for session slot (seconds)         | `30`    | float       |
+| `MCP_SESSION_POOL_CREATE_TIMEOUT`         | Timeout creating new session (seconds)             | `30`    | float       |
+| `MCP_SESSION_POOL_CIRCUIT_BREAKER_THRESHOLD` | Failures before circuit opens                   | `5`     | int         |
+| `MCP_SESSION_POOL_CIRCUIT_BREAKER_RESET`  | Seconds before circuit resets                      | `60`    | float       |
+| `MCP_SESSION_POOL_IDLE_EVICTION`          | Evict idle pool keys after (seconds)               | `600`   | float       |
+| `MCP_SESSION_POOL_EXPLICIT_HEALTH_RPC`    | Force explicit RPC on health checks                | `false` | bool        |
+
+> ⚡ **Performance**: Session pooling reduces per-request overhead from ~20ms to ~1-2ms (10-20x improvement). Sessions are isolated per user/tenant via identity hashing to prevent cross-user session sharing.
+>
+> 🔒 **Security**: Sessions are keyed by `(URL, identity_hash, transport_type)` to ensure different users never share sessions.
+>
+> 🏥 **Health Checks**: By default, the pool's internal staleness check handles health verification. Set `MCP_SESSION_POOL_EXPLICIT_HEALTH_RPC=true` for stricter verification at ~5ms latency cost per check.
 
 ### Database Management
 
@@ -2082,6 +2263,7 @@ MCP Gateway uses Alembic for database migrations. Common commands:
 | `ENABLE_HEADER_PASSTHROUGH`   | Enable HTTP header passthrough feature (⚠️ Security implications) | `false` | bool |
 | `ENABLE_OVERWRITE_BASE_HEADERS` | Enable overwriting of base headers (⚠️ Advanced usage) | `false` | bool |
 | `DEFAULT_PASSTHROUGH_HEADERS` | Default headers to pass through (JSON array)    | `["X-Tenant-Id", "X-Trace-Id"]` | JSON array |
+| `GLOBAL_CONFIG_CACHE_TTL`     | In-memory cache TTL for GlobalConfig (seconds). Reduces DB queries under load. | `60` | int (5-3600) |
 
 > ⚠️ **Security Warning**: Header passthrough is disabled by default for security. Only enable if you understand the implications and have reviewed which headers should be passed through to backing MCP servers. Authorization headers are not included in defaults.
 
@@ -2353,8 +2535,16 @@ curl -X POST -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
          }' \
      http://localhost:4444/tools
 
-# List tools
+# List tools (returns first 50 by default)
 curl -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" http://localhost:4444/tools
+
+# List tools with filtering and pagination
+curl -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
+     "http://localhost:4444/tools?gateway_id=<id>&limit=100&include_pagination=true"
+
+# Get ALL tools (no pagination limit)
+curl -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
+     "http://localhost:4444/tools?limit=0"
 
 # Get tool by ID
 curl -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" http://localhost:4444/tools/1
@@ -2367,9 +2557,9 @@ curl -X PUT -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
 
 # Toggle active status
 curl -X POST -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
-     http://localhost:4444/tools/1/toggle?activate=false
+     http://localhost:4444/tools/1/state?activate=false
 curl -X POST -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
-     http://localhost:4444/tools/1/toggle?activate=true
+     http://localhost:4444/tools/1/state?activate=true
 
 # Delete tool
 curl -X DELETE -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" http://localhost:4444/tools/1
@@ -2429,7 +2619,7 @@ curl -X POST -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
 
 # Toggle agent status
 curl -X POST -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
-     http://localhost:4444/a2a/agent-id/toggle?activate=false
+     http://localhost:4444/a2a/agent-id/state?activate=false
 
 # Delete agent
 curl -X DELETE -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
@@ -2479,7 +2669,7 @@ curl -X PUT -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
 
 # Toggle active status
 curl -X POST -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
-     http://localhost:4444/gateways/1/toggle?activate=false
+     http://localhost:4444/gateways/1/state?activate=false
 
 # Delete gateway
 curl -X DELETE -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" http://localhost:4444/gateways/1
@@ -2565,7 +2755,7 @@ curl -X PUT -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
 
 # Toggle active
 curl -X POST -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
-     http://localhost:4444/prompts/5/toggle?activate=false
+     http://localhost:4444/prompts/5/state?activate=false
 
 # Delete prompt
 curl -X DELETE -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" http://localhost:4444/prompts/greet
@@ -2623,7 +2813,7 @@ curl -X PUT -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
 
 # Toggle active
 curl -X POST -H "Authorization: Bearer $MCPGATEWAY_BEARER_TOKEN" \
-     http://localhost:4444/servers/UUID_OF_SERVER_1/toggle?activate=false
+     http://localhost:4444/servers/UUID_OF_SERVER_1/state?activate=false
 ```
 
 </details>

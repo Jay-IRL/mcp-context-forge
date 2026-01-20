@@ -20,13 +20,16 @@ The module consists of several key components:
 
 # Standard
 from datetime import datetime, timezone
-import json
 import time
 from typing import Any, AsyncGenerator, Dict, List, Literal, Optional, Union
 from uuid import uuid4
 
+# Third-Party
+import orjson
+
 try:
     # Third-Party
+    from langchain_core.language_models import BaseChatModel
     from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
     from langchain_core.tools import BaseTool
     from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -39,6 +42,7 @@ except ImportError:
     # Optional dependencies for LLM chat feature not installed
     # These are only needed if LLMCHAT_ENABLED=true
     _LLMCHAT_AVAILABLE = False
+    BaseChatModel = None  # type: ignore
     AIMessage = None  # type: ignore
     BaseMessage = None  # type: ignore
     HumanMessage = None  # type: ignore
@@ -238,7 +242,7 @@ class MCPServerConfig(BaseModel):
     model_config = {
         "json_schema_extra": {
             "examples": [
-                {"url": "https://mcp-server.example.com/mcp", "transport": "streamable_http", "auth_token": "your-token-here"},
+                {"url": "https://mcp-server.example.com/mcp", "transport": "streamable_http", "auth_token": "your-token-here"},  # nosec B105 - example placeholder
                 {"command": "python", "args": ["server.py"], "transport": "stdio"},
             ]
         }
@@ -524,6 +528,43 @@ class WatsonxConfig(BaseModel):
     }
 
 
+class GatewayConfig(BaseModel):
+    """
+    Configuration for MCP Gateway internal LLM provider.
+
+    Allows LLM Chat to use models configured in the gateway's LLM Settings.
+    The gateway routes requests to the appropriate configured provider.
+
+    Attributes:
+        model: Model ID (gateway model ID or provider model ID).
+        base_url: Gateway internal API URL (defaults to self).
+        temperature: Sampling temperature for response generation.
+        max_tokens: Maximum tokens to generate.
+        timeout: Request timeout in seconds.
+
+    Examples:
+        >>> config = GatewayConfig(model="gpt-4o")
+        >>> config.model
+        'gpt-4o'
+    """
+
+    model: str = Field(..., description="Gateway model ID to use")
+    base_url: Optional[str] = Field(None, description="Gateway internal API URL (optional, defaults to self)")
+    temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0, description="Sampling temperature")
+    max_tokens: Optional[int] = Field(None, gt=0, description="Maximum tokens to generate")
+    timeout: Optional[float] = Field(None, gt=0, description="Request timeout in seconds")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "model": "gpt-4o",
+                "temperature": 0.7,
+                "max_tokens": 4096,
+            }
+        }
+    }
+
+
 class LLMConfig(BaseModel):
     """
     Configuration for LLM provider.
@@ -580,12 +621,12 @@ class LLMConfig(BaseModel):
         'watsonx'
     """
 
-    provider: Literal["azure_openai", "openai", "anthropic", "aws_bedrock", "ollama", "watsonx"] = Field(..., description="LLM provider type")
-    config: Union[AzureOpenAIConfig, OpenAIConfig, AnthropicConfig, AWSBedrockConfig, OllamaConfig, WatsonxConfig] = Field(..., description="Provider-specific configuration")
+    provider: Literal["azure_openai", "openai", "anthropic", "aws_bedrock", "ollama", "watsonx", "gateway"] = Field(..., description="LLM provider type")
+    config: Union[AzureOpenAIConfig, OpenAIConfig, AnthropicConfig, AWSBedrockConfig, OllamaConfig, WatsonxConfig, GatewayConfig] = Field(..., description="Provider-specific configuration")
 
     @field_validator("config", mode="before")
     @classmethod
-    def validate_config_type(cls, v: Any, info) -> Union[AzureOpenAIConfig, OpenAIConfig, AnthropicConfig, AWSBedrockConfig, OllamaConfig, WatsonxConfig]:
+    def validate_config_type(cls, v: Any, info) -> Union[AzureOpenAIConfig, OpenAIConfig, AnthropicConfig, AWSBedrockConfig, OllamaConfig, WatsonxConfig, GatewayConfig]:
         """
         Validate and convert config dictionary to appropriate provider type.
 
@@ -620,6 +661,8 @@ class LLMConfig(BaseModel):
                 return OllamaConfig(**v)
             if provider == "watsonx":
                 return WatsonxConfig(**v)
+            if provider == "gateway":
+                return GatewayConfig(**v)
 
         return v
 
@@ -664,7 +707,7 @@ class MCPClientConfig(BaseModel):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "mcp_server": {"url": "https://mcp-server.example.com/mcp", "transport": "streamable_http", "auth_token": "your-token"},
+                "mcp_server": {"url": "https://mcp-server.example.com/mcp", "transport": "streamable_http", "auth_token": "your-token"},  # nosec B105 - example placeholder
                 "llm": {
                     "provider": "azure_openai",
                     "config": {"api_key": "your-key", "azure_endpoint": "https://your-resource.openai.azure.com/", "azure_deployment": "gpt-4", "api_version": "2024-05-01-preview"},
@@ -1377,6 +1420,326 @@ class WatsonxProvider:
         return self.config.model_id
 
 
+class GatewayProvider:
+    """
+    Gateway provider implementation for using models configured in LLM Settings.
+
+    Routes LLM requests through the gateway's configured providers, allowing
+    users to use models set up via the Admin UI's LLM Settings without needing
+    to configure credentials in environment variables or API requests.
+
+    Attributes:
+        config: Gateway configuration with model ID.
+        llm: Lazily initialized LLM instance.
+
+    Examples:
+        >>> config = GatewayConfig(model="gpt-4o")  # doctest: +SKIP
+        >>> provider = GatewayProvider(config)  # doctest: +SKIP
+        >>> provider.get_model_name()  # doctest: +SKIP
+        'gpt-4o'
+
+    Note:
+        Requires models to be configured via Admin UI -> Settings -> LLM Settings.
+    """
+
+    def __init__(self, config: GatewayConfig):
+        """
+        Initialize Gateway provider.
+
+        Args:
+            config: Gateway configuration with model ID and optional settings.
+
+        Examples:
+            >>> config = GatewayConfig(model="gpt-4o")  # doctest: +SKIP
+            >>> provider = GatewayProvider(config)  # doctest: +SKIP
+        """
+        self.config = config
+        self.llm = None
+        self._model_name: Optional[str] = None
+        self._underlying_provider = None
+        logger.info(f"Initializing Gateway provider with model: {config.model}")
+
+    def get_llm(self, model_type: str = "chat") -> Union[BaseChatModel, Any]:
+        """
+        Get LLM instance by looking up model from gateway's LLM Settings.
+
+        Fetches the model configuration from the database, decrypts API keys,
+        and creates the appropriate LangChain LLM instance based on provider type.
+
+        Args:
+            model_type: Type of model to return ('chat' or 'completion'). Defaults to 'chat'.
+
+        Returns:
+            Union[BaseChatModel, Any]: Configured LangChain chat or completion model instance.
+
+        Raises:
+            ValueError: If model not found or provider not enabled.
+            ImportError: If required provider package not installed.
+
+        Examples:
+            >>> config = GatewayConfig(model="gpt-4o")  # doctest: +SKIP
+            >>> provider = GatewayProvider(config)  # doctest: +SKIP
+            >>> llm = provider.get_llm()  # doctest: +SKIP
+
+        Note:
+            The LLM instance is lazily initialized and cached by model_type.
+        """
+        if self.llm is not None:
+            return self.llm
+
+        # Import here to avoid circular imports
+        # First-Party
+        from mcpgateway.db import LLMModel, LLMProvider, SessionLocal  # pylint: disable=import-outside-toplevel
+        from mcpgateway.utils.services_auth import decode_auth  # pylint: disable=import-outside-toplevel
+
+        model_id = self.config.model
+
+        with SessionLocal() as db:
+            # Try to find model by UUID first, then by model_id
+            model = db.query(LLMModel).filter(LLMModel.id == model_id).first()
+            if not model:
+                model = db.query(LLMModel).filter(LLMModel.model_id == model_id).first()
+
+            if not model:
+                raise ValueError(f"Model '{model_id}' not found in LLM Settings. Configure it via Admin UI -> Settings -> LLM Settings.")
+
+            if not model.enabled:
+                raise ValueError(f"Model '{model.model_id}' is disabled. Enable it in LLM Settings.")
+
+            # Get the provider
+            provider = db.query(LLMProvider).filter(LLMProvider.id == model.provider_id).first()
+            if not provider:
+                raise ValueError(f"Provider not found for model '{model.model_id}'")
+
+            if not provider.enabled:
+                raise ValueError(f"Provider '{provider.name}' is disabled. Enable it in LLM Settings.")
+
+            # Get decrypted API key
+            api_key = None
+            if provider.api_key:
+                auth_data = decode_auth(provider.api_key)
+                if isinstance(auth_data, dict):
+                    api_key = auth_data.get("api_key")
+                else:
+                    api_key = auth_data
+
+            # Store model name for get_model_name()
+            self._model_name = model.model_id
+
+            # Get temperature - use config override or provider default
+            temperature = self.config.temperature if self.config.temperature is not None else (provider.default_temperature or 0.7)
+            max_tokens = self.config.max_tokens or model.max_output_tokens
+
+            # Create appropriate LLM based on provider type
+            provider_type = provider.provider_type.lower()
+            config = provider.config or {}
+
+            # Common kwargs
+            kwargs: Dict[str, Any] = {
+                "temperature": temperature,
+                "timeout": self.config.timeout,
+            }
+
+            if provider_type == "openai":
+                kwargs.update(
+                    {
+                        "api_key": api_key,
+                        "model": model.model_id,
+                        "max_tokens": max_tokens,
+                    }
+                )
+                if provider.api_base:
+                    kwargs["base_url"] = provider.api_base
+
+                # Handle default headers
+                if config.get("default_headers"):
+                    kwargs["default_headers"] = config["default_headers"]
+                elif hasattr(self.config, "default_headers") and self.config.default_headers:  # type: ignore
+                    kwargs["default_headers"] = self.config.default_headers
+
+                if model_type == "chat":
+                    self.llm = ChatOpenAI(**kwargs)
+                else:
+                    self.llm = OpenAI(**kwargs)
+
+            elif provider_type == "azure_openai":
+                if not provider.api_base:
+                    raise ValueError("Azure OpenAI requires base_url (azure_endpoint) to be configured")
+
+                azure_deployment = config.get("azure_deployment", model.model_id)
+                api_version = config.get("api_version", "2024-05-01-preview")
+                max_retries = config.get("max_retries", 2)
+
+                kwargs.update(
+                    {
+                        "api_key": api_key,
+                        "azure_endpoint": provider.api_base,
+                        "azure_deployment": azure_deployment,
+                        "api_version": api_version,
+                        "model": model.model_id,
+                        "max_tokens": int(max_tokens) if max_tokens is not None else None,
+                        "max_retries": max_retries,
+                    }
+                )
+
+                if model_type == "chat":
+                    self.llm = AzureChatOpenAI(**kwargs)
+                else:
+                    self.llm = AzureOpenAI(**kwargs)
+
+            elif provider_type == "anthropic":
+                if not _ANTHROPIC_AVAILABLE:
+                    raise ImportError("Anthropic provider requires langchain-anthropic. Install with: pip install langchain-anthropic")
+
+                # Anthropic uses 'model_name' instead of 'model'
+                anthropic_kwargs = {
+                    "api_key": api_key,
+                    "model_name": model.model_id,
+                    "max_tokens": max_tokens or 4096,
+                    "temperature": temperature,
+                    "timeout": self.config.timeout,
+                    "default_request_timeout": self.config.timeout,
+                }
+
+                if model_type == "chat":
+                    self.llm = ChatAnthropic(**anthropic_kwargs)
+                else:
+                    # Generic Anthropic completion model if needed, though mostly chat used now
+                    if AnthropicLLM:
+                        llm_kwargs = anthropic_kwargs.copy()
+                        llm_kwargs["model"] = llm_kwargs.pop("model_name")
+                        self.llm = AnthropicLLM(**llm_kwargs)
+                    else:
+                        raise ImportError("Anthropic completion model (AnthropicLLM) not available")
+
+            elif provider_type == "bedrock":
+                if not _BEDROCK_AVAILABLE:
+                    raise ImportError("AWS Bedrock provider requires langchain-aws. Install with: pip install langchain-aws boto3")
+
+                region_name = config.get("region_name", "us-east-1")
+                credentials_kwargs = {}
+                if config.get("aws_access_key_id"):
+                    credentials_kwargs["aws_access_key_id"] = config["aws_access_key_id"]
+                if config.get("aws_secret_access_key"):
+                    credentials_kwargs["aws_secret_access_key"] = config["aws_secret_access_key"]
+                if config.get("aws_session_token"):
+                    credentials_kwargs["aws_session_token"] = config["aws_session_token"]
+
+                model_kwargs = {
+                    "temperature": temperature,
+                    "max_tokens": max_tokens or 4096,
+                }
+
+                if model_type == "chat":
+                    self.llm = ChatBedrock(
+                        model_id=model.model_id,
+                        region_name=region_name,
+                        model_kwargs=model_kwargs,
+                        **credentials_kwargs,
+                    )
+                else:
+                    self.llm = BedrockLLM(
+                        model_id=model.model_id,
+                        region_name=region_name,
+                        model_kwargs=model_kwargs,
+                        **credentials_kwargs,
+                    )
+
+            elif provider_type == "ollama":
+                base_url = provider.api_base or "http://localhost:11434"
+                num_ctx = config.get("num_ctx")
+
+                # Explicitly construct kwargs to avoid generic unpacking issues with Pydantic models
+                ollama_kwargs = {
+                    "base_url": base_url,
+                    "model": model.model_id,
+                    "temperature": temperature,
+                    "timeout": self.config.timeout,
+                }
+                if num_ctx:
+                    ollama_kwargs["num_ctx"] = num_ctx
+
+                if model_type == "chat":
+                    self.llm = ChatOllama(**ollama_kwargs)
+                else:
+                    self.llm = OllamaLLM(**ollama_kwargs)
+
+            elif provider_type == "watsonx":
+                if not _WATSONX_AVAILABLE:
+                    raise ImportError("IBM watsonx.ai provider requires langchain-ibm. Install with: pip install langchain-ibm")
+
+                project_id = config.get("project_id")
+                if not project_id:
+                    raise ValueError("IBM watsonx.ai requires project_id in config")
+
+                url = provider.api_base or "https://us-south.ml.cloud.ibm.com"
+
+                params = {
+                    "temperature": temperature,
+                    "max_new_tokens": max_tokens or 1024,
+                    "min_new_tokens": config.get("min_new_tokens", 1),
+                    "decoding_method": config.get("decoding_method", "sample"),
+                    "top_k": config.get("top_k", 50),
+                    "top_p": config.get("top_p", 1.0),
+                }
+
+                if model_type == "chat":
+                    self.llm = ChatWatsonx(
+                        apikey=api_key,
+                        url=url,
+                        project_id=project_id,
+                        model_id=model.model_id,
+                        params=params,
+                    )
+                else:
+                    self.llm = WatsonxLLM(
+                        apikey=api_key,
+                        url=url,
+                        project_id=project_id,
+                        model_id=model.model_id,
+                        params=params,
+                    )
+
+            elif provider_type == "openai_compatible":
+                if not provider.api_base:
+                    raise ValueError("OpenAI-compatible provider requires base_url to be configured")
+
+                kwargs.update(
+                    {
+                        "api_key": api_key or "no-key-required",
+                        "model": model.model_id,
+                        "base_url": provider.api_base,
+                        "max_tokens": max_tokens,
+                    }
+                )
+
+                if model_type == "chat":
+                    self.llm = ChatOpenAI(**kwargs)
+                else:
+                    self.llm = OpenAI(**kwargs)
+
+            else:
+                raise ValueError(f"Unsupported LLM provider: {provider_type}")
+
+            logger.info(f"Gateway provider created LLM instance for model: {model.model_id} via {provider_type}")
+            return self.llm
+
+    def get_model_name(self) -> str:
+        """
+        Get the model name.
+
+        Returns:
+            str: The model name/ID.
+
+        Examples:
+            >>> config = GatewayConfig(model="gpt-4o")  # doctest: +SKIP
+            >>> provider = GatewayProvider(config)  # doctest: +SKIP
+            >>> provider.get_model_name()  # doctest: +SKIP
+            'gpt-4o'
+        """
+        return self._model_name or self.config.model
+
+
 class LLMProviderFactory:
     """
     Factory for creating LLM providers.
@@ -1399,7 +1762,7 @@ class LLMProviderFactory:
     """
 
     @staticmethod
-    def create(llm_config: LLMConfig) -> Union[AzureOpenAIProvider, OpenAIProvider, AnthropicProvider, AWSBedrockProvider, OllamaProvider, WatsonxProvider]:
+    def create(llm_config: LLMConfig) -> Union[AzureOpenAIProvider, OpenAIProvider, AnthropicProvider, AWSBedrockProvider, OllamaProvider, WatsonxProvider, GatewayProvider]:
         """
         Create an LLM provider based on configuration.
 
@@ -1407,7 +1770,7 @@ class LLMProviderFactory:
             llm_config: LLM configuration specifying provider type and settings.
 
         Returns:
-            Union[AzureOpenAIProvider, OpenAIProvider, AnthropicProvider, AWSBedrockProvider, OllamaProvider]: Instantiated provider.
+            Union[AzureOpenAIProvider, OpenAIProvider, AnthropicProvider, AWSBedrockProvider, OllamaProvider, WatsonxProvider, GatewayProvider]: Instantiated provider.
 
         Raises:
             ValueError: If provider type is not supported.
@@ -1455,6 +1818,7 @@ class LLMProviderFactory:
             "aws_bedrock": AWSBedrockProvider,
             "ollama": OllamaProvider,
             "watsonx": WatsonxProvider,
+            "gateway": GatewayProvider,
         }
 
         provider_class = provider_map.get(llm_config.provider)
@@ -1571,8 +1935,8 @@ class ChatHistoryManager:
                 data = await self.redis_client.get(self._history_key(user_id))
                 if not data:
                     return []
-                return json.loads(data)
-            except json.JSONDecodeError:
+                return orjson.loads(data)
+            except orjson.JSONDecodeError:
                 logger.warning(f"Failed to decode chat history for user {user_id}")
                 return []
             except Exception as e:
@@ -1606,7 +1970,7 @@ class ChatHistoryManager:
 
         if self.redis_client:
             try:
-                await self.redis_client.set(self._history_key(user_id), json.dumps(trimmed), ex=self.ttl)
+                await self.redis_client.set(self._history_key(user_id), orjson.dumps(trimmed), ex=self.ttl)
             except Exception as e:
                 logger.error(f"Error saving chat history to Redis for user {user_id}: {e}")
         else:
@@ -2335,11 +2699,57 @@ class MCPChatService:
         full_response = ""
         start_ts = time.time()
         tool_runs: dict[str, dict[str, Any]] = {}
+        # Buffer for out-of-order on_tool_end events (end arrives before start)
+        pending_tool_ends: dict[str, dict[str, Any]] = {}
+        pending_ttl_seconds = 30.0  # Max time to hold pending end events
+        pending_max_size = 100  # Max number of pending end events to buffer
+        # Track dropped run_ids for aggregated error (TTL-expired or buffer-full)
+        dropped_tool_ends: set[str] = set()
+        dropped_max_size = 200  # Max dropped IDs to track (prevents unbounded growth)
+        dropped_overflow_count = 0  # Count of drops that couldn't be tracked due to full buffer
+
+        def _extract_output(raw_output: Any) -> Any:
+            """Extract output value from various LangChain output formats.
+
+            Args:
+                raw_output: The raw output from a tool execution.
+
+            Returns:
+                The extracted output value in a serializable format.
+            """
+            if hasattr(raw_output, "content"):
+                return raw_output.content
+            if hasattr(raw_output, "dict") and callable(raw_output.dict):
+                return raw_output.dict()
+            if not isinstance(raw_output, (str, int, float, bool, list, dict, type(None))):
+                return str(raw_output)
+            return raw_output
+
+        def _cleanup_expired_pending(current_ts: float) -> None:
+            """Remove expired entries from pending_tool_ends buffer and track them.
+
+            Args:
+                current_ts: Current timestamp in seconds since epoch.
+            """
+            nonlocal dropped_overflow_count
+            expired = [rid for rid, data in pending_tool_ends.items() if current_ts - data.get("buffered_at", 0) > pending_ttl_seconds]
+            for rid in expired:
+                logger.warning(f"Pending on_tool_end for run_id {rid} expired after {pending_ttl_seconds}s (orphan event)")
+                if len(dropped_tool_ends) < dropped_max_size:
+                    dropped_tool_ends.add(rid)
+                else:
+                    dropped_overflow_count += 1
+                    logger.warning(f"Dropped tool ends tracking full ({dropped_max_size}), cannot track expired run_id {rid} (overflow count: {dropped_overflow_count})")
+                del pending_tool_ends[rid]
 
         try:
             async for event in self._agent.astream_events({"messages": lc_messages}, version="v2"):
                 kind = event.get("event")
                 now_iso = datetime.now(timezone.utc).isoformat()
+                now_ts = time.time()
+
+                # Periodically cleanup expired pending ends
+                _cleanup_expired_pending(now_ts)
 
                 try:
                     if kind == "on_tool_start":
@@ -2347,33 +2757,70 @@ class MCPChatService:
                         name = event.get("name") or event.get("data", {}).get("name") or event.get("data", {}).get("tool")
                         input_data = event.get("data", {}).get("input")
 
+                        # Filter out common metadata keys injected by LangChain/LangGraph
+                        if isinstance(input_data, dict):
+                            input_data = {k: v for k, v in input_data.items() if k not in ["runtime", "config", "run_manager", "callbacks"]}
+
                         tool_runs[run_id] = {"name": name, "start": now_iso, "input": input_data}
 
                         yield {"type": "tool_start", "id": run_id, "tool": name, "input": input_data, "start": now_iso}
 
+                        # NOTE: Do NOT clear from dropped_tool_ends here. If an end was dropped (TTL/buffer-full)
+                        # before this start arrived, that end is permanently lost. Since tools only end once,
+                        # we won't receive another end event, so this should still be reported as an orphan.
+
+                        # Check if we have a buffered end event for this run_id (out-of-order reconciliation)
+                        if run_id in pending_tool_ends:
+                            buffered = pending_tool_ends.pop(run_id)
+                            tool_runs[run_id]["end"] = buffered["end_time"]
+                            tool_runs[run_id]["output"] = buffered["output"]
+                            logger.info(f"Reconciled out-of-order on_tool_end for run_id {run_id}")
+
+                            if tool_runs[run_id].get("output") == "":
+                                error = "Tool execution failed: Please check if the tool is accessible"
+                                yield {"type": "tool_error", "id": run_id, "tool": name, "error": error, "time": buffered["end_time"]}
+
+                            yield {"type": "tool_end", "id": run_id, "tool": name, "output": tool_runs[run_id].get("output"), "end": buffered["end_time"]}
+
                     elif kind == "on_tool_end":
                         run_id = str(event.get("run_id") or uuid4())
                         output = event.get("data", {}).get("output")
+                        extracted_output = _extract_output(output)
 
                         if run_id in tool_runs:
+                            # Normal case: start already received
                             tool_runs[run_id]["end"] = now_iso
+                            tool_runs[run_id]["output"] = extracted_output
 
-                            if hasattr(output, "content"):
-                                tool_runs[run_id]["output"] = output.content
-                            elif (hasattr(output, "__class__")) or (hasattr(output, "dict") and callable(output.dict)):
-                                tool_runs[run_id]["output"] = output.dict()
-                            elif not isinstance(output, (str, int, float, bool, list, dict, type(None))):
-                                tool_runs[run_id]["output"] = str(output)
+                            if tool_runs[run_id].get("output") == "":
+                                error = "Tool execution failed: Please check if the tool is accessible"
+                                yield {"type": "tool_error", "id": run_id, "tool": tool_runs.get(run_id, {}).get("name"), "error": error, "time": now_iso}
 
-                        if tool_runs[run_id]["output"] == "":
-                            error = "Tool execution failed: Please check if the tool is accessible"
-                            yield {"type": "tool_error", "id": run_id, "tool": tool_runs.get(run_id, {}).get("name"), "error": error, "time": now_iso}
-
-                        yield {"type": "tool_end", "id": run_id, "tool": tool_runs.get(run_id, {}).get("name"), "output": tool_runs[run_id]["output"], "end": now_iso}
+                            yield {"type": "tool_end", "id": run_id, "tool": tool_runs.get(run_id, {}).get("name"), "output": tool_runs[run_id].get("output"), "end": now_iso}
+                        else:
+                            # Out-of-order: buffer the end event for later reconciliation
+                            if len(pending_tool_ends) < pending_max_size:
+                                pending_tool_ends[run_id] = {"output": extracted_output, "end_time": now_iso, "buffered_at": now_ts}
+                                logger.debug(f"Buffered out-of-order on_tool_end for run_id {run_id}, awaiting on_tool_start")
+                            else:
+                                logger.warning(f"Pending tool ends buffer full ({pending_max_size}), dropping on_tool_end for run_id {run_id}")
+                                if len(dropped_tool_ends) < dropped_max_size:
+                                    dropped_tool_ends.add(run_id)
+                                else:
+                                    dropped_overflow_count += 1
+                                    logger.warning(f"Dropped tool ends tracking full ({dropped_max_size}), cannot track run_id {run_id} (overflow count: {dropped_overflow_count})")
 
                     elif kind == "on_tool_error":
                         run_id = str(event.get("run_id") or uuid4())
                         error = str(event.get("data", {}).get("error", "Unknown error"))
+
+                        # Clear any buffered end for this run to avoid emitting both error and end
+                        if run_id in pending_tool_ends:
+                            del pending_tool_ends[run_id]
+                            logger.debug(f"Cleared buffered on_tool_end for run_id {run_id} due to tool error")
+
+                        # Clear from dropped set if this run was previously dropped (prevents false orphan)
+                        dropped_tool_ends.discard(run_id)
 
                         yield {"type": "tool_error", "id": run_id, "tool": tool_runs.get(run_id, {}).get("name"), "error": error, "time": now_iso}
 
@@ -2388,6 +2835,48 @@ class MCPChatService:
                 except Exception as event_error:
                     logger.warning(f"Error processing event {kind}: {event_error}")
                     continue
+
+            # Emit aggregated error for any orphan/dropped tool ends
+            # De-duplicate IDs (in case same ID was buffered and dropped in edge cases)
+            all_orphan_ids = sorted(set(pending_tool_ends.keys()) | dropped_tool_ends)
+            if all_orphan_ids or dropped_overflow_count > 0:
+                buffered_count = len(pending_tool_ends)
+                dropped_count = len(dropped_tool_ends)
+                total_unique = len(all_orphan_ids)
+                total_affected = total_unique + dropped_overflow_count
+                logger.warning(
+                    f"Stream completed with {total_affected} orphan tool end(s): {buffered_count} buffered, {dropped_count} dropped (tracked), {dropped_overflow_count} dropped (untracked overflow)"
+                )
+                # Log full list at debug level for observability
+                if all_orphan_ids:
+                    logger.debug(f"Full orphan run_id list: {', '.join(all_orphan_ids)}")
+                now_iso = datetime.now(timezone.utc).isoformat()
+                error_parts = []
+                if buffered_count > 0:
+                    error_parts.append(f"{buffered_count} buffered")
+                if dropped_count > 0:
+                    error_parts.append(f"{dropped_count} dropped (TTL expired or buffer full)")
+                if dropped_overflow_count > 0:
+                    error_parts.append(f"{dropped_overflow_count} additional dropped (tracking overflow)")
+                error_msg = f"Tool execution incomplete: {total_affected} tool end(s) received without matching start ({', '.join(error_parts)})"
+                # Truncate to first 10 IDs in error message to avoid excessive payload
+                if all_orphan_ids:
+                    max_display_ids = 10
+                    display_ids = all_orphan_ids[:max_display_ids]
+                    remaining = total_unique - len(display_ids)
+                    if remaining > 0:
+                        error_msg += f". Run IDs (first {max_display_ids} of {total_unique}): {', '.join(display_ids)} (+{remaining} more)"
+                    else:
+                        error_msg += f". Run IDs: {', '.join(display_ids)}"
+                yield {
+                    "type": "tool_error",
+                    "id": str(uuid4()),
+                    "tool": None,
+                    "error": error_msg,
+                    "time": now_iso,
+                }
+                pending_tool_ends.clear()
+                dropped_tool_ends.clear()
 
             # Calculate elapsed time
             elapsed_ms = int((time.time() - start_ts) * 1000)

@@ -51,8 +51,7 @@ Examples:
 # Standard
 import asyncio
 from asyncio import Task
-from datetime import datetime, timezone
-import json
+from datetime import datetime, timedelta, timezone
 import logging
 import time
 import traceback
@@ -62,6 +61,7 @@ import uuid
 
 # Third-Party
 from fastapi import HTTPException, status
+import orjson
 
 # First-Party
 from mcpgateway import __version__
@@ -72,6 +72,7 @@ from mcpgateway.services import PromptService, ResourceService, ToolService
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.transports import SSETransport
 from mcpgateway.utils.create_jwt_token import create_jwt_token
+from mcpgateway.utils.redis_client import get_redis_client
 from mcpgateway.utils.retry_manager import ResilientHttpClient
 from mcpgateway.validation.jsonrpc import JSONRPCError
 
@@ -197,8 +198,9 @@ class SessionBackend:
             if not redis_url:
                 raise ValueError("Redis backend requires redis_url")
 
-            self._redis = Redis.from_url(redis_url)
-            self._pubsub = self._redis.pubsub()
+            # Redis client is set in initialize() via the shared factory
+            self._redis: Optional[Redis] = None
+            self._pubsub = None
 
         elif self._backend == "database":
             if not SQLALCHEMY_AVAILABLE:
@@ -326,7 +328,12 @@ class SessionRegistry(SessionBackend):
             logger.info("Database cleanup task started")
 
         elif self._backend == "redis":
-            await self._pubsub.subscribe("mcp_session_events")
+            # Get shared Redis client from factory
+            self._redis = await get_redis_client()
+            if self._redis:
+                self._pubsub = self._redis.pubsub()
+                await self._pubsub.subscribe("mcp_session_events")
+                logger.info("Session registry connected to shared Redis client")
 
         elif self._backend == "none":
             # Nothing to initialize for none backend
@@ -363,17 +370,15 @@ class SessionRegistry(SessionBackend):
             except asyncio.CancelledError:
                 pass
 
-        # Close Redis connections
-        if self._backend == "redis":
+        # Close Redis pubsub (but not the shared client)
+        if self._backend == "redis" and getattr(self, "_pubsub", None):
             try:
                 await self._pubsub.aclose()
-                await self._redis.aclose()
             except Exception as e:
-                logger.error(f"Error closing Redis connection: {e}")
-                # Error example:
-                # >>> import logging
-                # >>> logger = logging.getLogger(__name__)
-                # >>> logger.error(f"Error closing Redis connection: Connection lost")  # doctest: +SKIP
+                logger.error(f"Error closing Redis pubsub: {e}")
+            # Don't close self._redis - it's the shared client managed by redis_client.py
+            self._redis = None
+            self._pubsub = None
 
     async def add_session(self, session_id: str, transport: SSETransport) -> None:
         """Add a session to the registry.
@@ -420,10 +425,13 @@ class SessionRegistry(SessionBackend):
 
         if self._backend == "redis":
             # Store session marker in Redis
+            if not self._redis:
+                logger.warning(f"Redis client not initialized, skipping distributed session tracking for {session_id}")
+                return
             try:
                 await self._redis.setex(f"mcp:session:{session_id}", self._session_ttl, "1")
                 # Publish event to notify other workers
-                await self._redis.publish("mcp_session_events", json.dumps({"type": "add", "session_id": session_id, "timestamp": time.time()}))
+                await self._redis.publish("mcp_session_events", orjson.dumps({"type": "add", "session_id": session_id, "timestamp": time.time()}))
             except Exception as e:
                 logger.error(f"Redis error adding session {session_id}: {e}")
 
@@ -515,6 +523,8 @@ class SessionRegistry(SessionBackend):
 
         # If not in local cache, check if it exists in shared backend
         if self._backend == "redis":
+            if not self._redis:
+                return None
             try:
                 exists = await self._redis.exists(f"mcp:session:{session_id}")
                 session_exists = bool(exists)
@@ -616,10 +626,12 @@ class SessionRegistry(SessionBackend):
 
         # Remove from shared backend
         if self._backend == "redis":
+            if not self._redis:
+                return
             try:
                 await self._redis.delete(f"mcp:session:{session_id}")
                 # Notify other workers
-                await self._redis.publish("mcp_session_events", json.dumps({"type": "remove", "session_id": session_id, "timestamp": time.time()}))
+                await self._redis.publish("mcp_session_events", orjson.dumps({"type": "remove", "session_id": session_id, "timestamp": time.time()}))
             except Exception as e:
                 logger.error(f"Redis error removing session {session_id}: {e}")
 
@@ -690,37 +702,47 @@ class SessionRegistry(SessionBackend):
             True
             >>> reg._session_message['session_id']
             'session-789'
-            >>> json.loads(reg._session_message['message']) == message
+            >>> orjson.loads(reg._session_message['message'])['message'] == message
             True
         """
         # Skip for none backend only
         if self._backend == "none":
             return
 
-        if self._backend == "memory":
-            if isinstance(message, (dict, list)):
-                msg_json = json.dumps(message)
-            else:
-                msg_json = json.dumps(str(message))
+        def _build_payload(msg: Any) -> str:
+            """Build a JSON payload for message broadcasting.
 
-            self._session_message: Dict[str, Any] | None = {"session_id": session_id, "message": msg_json}
+            Args:
+                msg: Message to wrap in payload envelope.
+
+            Returns:
+                JSON-encoded string containing type, message, and timestamp.
+            """
+            payload = {"type": "message", "message": msg, "timestamp": time.time()}
+            return orjson.dumps(payload).decode()
+
+        if self._backend == "memory":
+            payload_json = _build_payload(message)
+            self._session_message: Dict[str, Any] | None = {"session_id": session_id, "message": payload_json}
 
         elif self._backend == "redis":
+            if not self._redis:
+                logger.warning(f"Redis client not initialized, cannot broadcast to {session_id}")
+                return
             try:
-                if isinstance(message, (dict, list)):
-                    msg_json = json.dumps(message)
-                else:
-                    msg_json = json.dumps(str(message))
-
-                await self._redis.publish(session_id, json.dumps({"type": "message", "message": msg_json, "timestamp": time.time()}))
+                broadcast_payload = {
+                    "type": "message",
+                    "message": message,  # Keep as original type, not pre-encoded
+                    "timestamp": time.time(),
+                }
+                # Single encode
+                payload_json = orjson.dumps(broadcast_payload)
+                await self._redis.publish(session_id, payload_json)  # Single encode
             except Exception as e:
                 logger.error(f"Redis error during broadcast: {e}")
         elif self._backend == "database":
             try:
-                if isinstance(message, (dict, list)):
-                    msg_json = json.dumps(message)
-                else:
-                    msg_json = json.dumps(str(message))
+                msg_json = _build_payload(message)
 
                 def _db_add() -> None:
                     """Store message in the database for inter-process communication.
@@ -839,13 +861,23 @@ class SessionRegistry(SessionBackend):
             pass
 
         elif self._backend == "memory":
-            # if self._session_message:
             transport = self.get_session_sync(session_id)
             if transport and self._session_message:
-                message = json.loads(str(self._session_message.get("message")))
-                await self.generate_response(message=message, transport=transport, server_id=server_id, user=user, base_url=base_url)
+                message_json = self._session_message.get("message")
+                if message_json:
+                    data = orjson.loads(message_json)
+                    if isinstance(data, dict) and "message" in data:
+                        message = data["message"]
+                    else:
+                        message = data
+                    await self.generate_response(message=message, transport=transport, server_id=server_id, user=user, base_url=base_url)
+                else:
+                    logger.warning(f"Session message stored but message content is None for session {session_id}")
 
         elif self._backend == "redis":
+            if not self._redis:
+                logger.warning(f"Redis client not initialized, cannot respond to {session_id}")
+                return
             pubsub = self._redis.pubsub()
             await pubsub.subscribe(session_id)
 
@@ -853,10 +885,8 @@ class SessionRegistry(SessionBackend):
                 async for msg in pubsub.listen():
                     if msg["type"] != "message":
                         continue
-                    data = json.loads(msg["data"])
+                    data = orjson.loads(msg["data"])
                     message = data.get("message", {})
-                    if isinstance(message, str):
-                        message = json.loads(message)
                     transport = self.get_session_sync(session_id)
                     if transport:
                         await self.generate_response(message=message, transport=transport, server_id=server_id, user=user, base_url=base_url)
@@ -864,75 +894,80 @@ class SessionRegistry(SessionBackend):
                 logger.info(f"PubSub listener for session {session_id} cancelled")
             finally:
                 await pubsub.unsubscribe(session_id)
-                await pubsub.close()
+                try:
+                    await pubsub.aclose()
+                except AttributeError:
+                    await pubsub.close()
                 logger.info(f"Cleaned up pubsub for session {session_id}")
 
         elif self._backend == "database":
 
-            def _db_read_session(session_id: str) -> SessionRecord | None:
-                """Check if session still exists in the database.
+            def _db_read_session_and_message(
+                session_id: str,
+            ) -> tuple[SessionRecord | None, SessionMessageRecord | None]:
+                """
+                Check whether a session exists and retrieve its next pending message
+                in a single database query.
 
-                Queries the SessionRecord table to verify that the session
-                is still active. Used in the message polling loop to determine
-                when to stop checking for messages.
+                This function performs a LEFT OUTER JOIN between SessionRecord and
+                SessionMessageRecord to determine:
 
-                This inner function is designed to be run in a thread executor
-                to avoid blocking the async event loop during database reads.
+                - Whether the session still exists
+                - Whether there is a pending message for the session (FIFO order)
+
+                It is used by the database-backed message polling loop to reduce
+                database load by collapsing multiple reads into a single query.
+
+                Messages are returned in FIFO order based on the message primary key.
+
+                This function is designed to be run in a thread executor to avoid
+                blocking the async event loop during database access.
 
                 Args:
                     session_id: The session identifier to look up.
 
                 Returns:
-                    SessionRecord: The session record if found, None otherwise.
+                    Tuple[SessionRecord | None, SessionMessageRecord | None]:
+
+                    - (None, None)
+                        The session does not exist.
+
+                    - (SessionRecord, None)
+                        The session exists but has no pending messages.
+
+                    - (SessionRecord, SessionMessageRecord)
+                        The session exists and has a pending message.
 
                 Raises:
                     Exception: Any database error is re-raised after rollback.
 
                 Examples:
                     >>> # This function is called internally by message_check_loop()
-                    >>> # Returns SessionRecord object if session exists
-                    >>> # Returns None if session has been removed
+                    >>> # Session exists and has a pending message
+                    >>> # Returns (SessionRecord, SessionMessageRecord)
+
+                    >>> # Session exists but has no pending messages
+                    >>> # Returns (SessionRecord, None)
+
+                    >>> # Session has been removed
+                    >>> # Returns (None, None)
                 """
                 db_session = next(get_db())
                 try:
-                    # Delete sessions that haven't been accessed for TTL seconds
-                    result = db_session.query(SessionRecord).filter_by(session_id=session_id).first()
-                    return result
-                except Exception as ex:
-                    db_session.rollback()
-                    raise ex
-                finally:
-                    db_session.close()
-
-            def _db_read(session_id: str) -> SessionMessageRecord | None:
-                """Read pending message for a session from the database.
-
-                Retrieves the first (oldest) unprocessed message for the given
-                session_id from the SessionMessageRecord table. Messages are
-                processed in FIFO order.
-
-                This inner function is designed to be run in a thread executor
-                to avoid blocking the async event loop during database queries.
-
-                Args:
-                    session_id: The session identifier to read messages for.
-
-                Returns:
-                    SessionMessageRecord: The oldest message record if found, None otherwise.
-
-                Raises:
-                    Exception: Any database error is re-raised after rollback.
-
-                Examples:
-                    >>> # This function is called internally by message_check_loop()
-                    >>> # Returns SessionMessageRecord with message data
-                    >>> # Returns None if no pending messages
-                """
-                db_session = next(get_db())
-                try:
-                    # Delete sessions that haven't been accessed for TTL seconds
-                    result = db_session.query(SessionMessageRecord).filter_by(session_id=session_id).first()
-                    return result
+                    result = (
+                        db_session.query(SessionRecord, SessionMessageRecord)
+                        .outerjoin(
+                            SessionMessageRecord,
+                            SessionMessageRecord.session_id == SessionRecord.session_id,
+                        )
+                        .filter(SessionRecord.session_id == session_id)
+                        .order_by(SessionMessageRecord.id.asc())
+                        .first()
+                    )
+                    if not result:
+                        return None, None
+                    session, message = result
+                    return session, message
                 except Exception as ex:
                     db_session.rollback()
                     raise ex
@@ -973,43 +1008,99 @@ class SessionRegistry(SessionBackend):
                     db_session.close()
 
             async def message_check_loop(session_id: str) -> None:
-                """Poll database for messages and deliver to local transport.
+                """
+                Background task that polls the database for messages belonging to a session
+                using adaptive polling with exponential backoff.
 
-                Continuously checks the database for new messages directed to
-                the specified session_id. When messages are found and the
-                transport exists locally, delivers the message and removes it
-                from the database. Exits when the session no longer exists.
+                The loop continues until the session is removed from the database.
 
-                This coroutine runs as a background task for each active session
-                using database backend, enabling message delivery across worker
-                processes.
+                Behavior:
+                    - Starts with a fast polling interval for low-latency message delivery.
+                    - When no message is found, the polling interval increases exponentially
+                    (up to a configured maximum) to reduce database load.
+                    - When a message is received, the polling interval is immediately reset
+                    to the fast interval.
+                    - The loop exits as soon as the session no longer exists.
+
+                Polling rules:
+                    - Message found  → process message, reset polling interval.
+                    - No message     → increase polling interval (backoff).
+                    - Session gone   → stop polling immediately.
 
                 Args:
-                    session_id: The session identifier to monitor for messages.
+                    session_id (str): Unique identifier of the session to monitor.
 
-                Examples:
-                    >>> # This function is called as a task by respond()
-                    >>> # asyncio.create_task(message_check_loop('abc123'))
-                    >>> # Polls every 0.1 seconds until session is removed
-                    >>> # Delivers messages to transport and cleans up database
+                Examples
+                --------
+                Adaptive backoff when no messages are present:
+
+                >>> poll_interval = 0.1
+                >>> backoff_factor = 1.5
+                >>> max_interval = 5.0
+                >>> poll_interval = min(poll_interval * backoff_factor, max_interval)
+                >>> poll_interval
+                0.15000000000000002
+
+                Backoff continues until the maximum interval is reached:
+
+                >>> poll_interval = 4.0
+                >>> poll_interval = min(poll_interval * 1.5, 5.0)
+                >>> poll_interval
+                5.0
+
+                Polling interval resets immediately when a message arrives:
+
+                >>> poll_interval = 2.0
+                >>> poll_interval = 0.1
+                >>> poll_interval
+                0.1
+
+                Session termination stops polling:
+
+                >>> session_exists = False
+                >>> if not session_exists:
+                ...     "polling stopped"
+                'polling stopped'
                 """
+
+                poll_interval = settings.poll_interval  # start fast
+                max_interval = settings.max_interval  # cap at configured maximum
+                backoff_factor = settings.backoff_factor
                 while True:
-                    record = await asyncio.to_thread(_db_read, session_id)
+                    session, record = await asyncio.to_thread(_db_read_session_and_message, session_id)
+
+                    # session gone → stop polling
+                    if not session:
+                        logger.debug("Session %s no longer exists, stopping poll loop", session_id)
+                        break
 
                     if record:
-                        message = json.loads(record.message)
+                        poll_interval = settings.poll_interval  # reset on activity
+
+                        data = orjson.loads(record.message)
+                        if isinstance(data, dict) and "message" in data:
+                            message = data["message"]
+                        else:
+                            message = data
+
                         transport = self.get_session_sync(session_id)
                         if transport:
                             logger.info("Ready to respond")
-                            await self.generate_response(message=message, transport=transport, server_id=server_id, user=user, base_url=base_url)
+                            await self.generate_response(
+                                message=message,
+                                transport=transport,
+                                server_id=server_id,
+                                user=user,
+                                base_url=base_url,
+                            )
 
                             await asyncio.to_thread(_db_remove, session_id, record.message)
+                    else:
+                        # no message → backoff
+                        # update polling interval with backoff factor
+                        poll_interval = min(poll_interval * backoff_factor, max_interval)
 
-                    session_exists = await asyncio.to_thread(_db_read_session, session_id)
-                    if not session_exists:
-                        break
-
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(poll_interval)
 
             asyncio.create_task(message_check_loop(session_id))
 
@@ -1020,6 +1111,8 @@ class SessionRegistry(SessionBackend):
         It checks all local sessions, refreshes TTLs for connected sessions, and
         removes disconnected ones.
         """
+        if not self._redis:
+            return
         try:
             # Check all local sessions
             local_transports = {}
@@ -1079,7 +1172,8 @@ class SessionRegistry(SessionBackend):
                     db_session = next(get_db())
                     try:
                         # Delete sessions that haven't been accessed for TTL seconds
-                        expiry_time = func.now() - func.make_interval(seconds=self._session_ttl)  # pylint: disable=not-callable
+                        # Use Python datetime for database-agnostic expiry calculation
+                        expiry_time = datetime.now(timezone.utc) - timedelta(seconds=self._session_ttl)
                         result = db_session.query(SessionRecord).filter(SessionRecord.last_accessed < expiry_time).delete()
                         db_session.commit()
                         return result
@@ -1094,65 +1188,7 @@ class SessionRegistry(SessionBackend):
                     logger.info(f"Cleaned up {deleted} expired database sessions")
 
                 # Check local sessions against database
-                local_transports = {}
-                async with self._lock:
-                    local_transports = self._sessions.copy()
-
-                for session_id, transport in local_transports.items():
-                    try:
-                        if not await transport.is_connected():
-                            await self.remove_session(session_id)
-                            continue
-
-                        # Refresh session in database
-                        def _refresh_session(session_id: str = session_id) -> bool:
-                            """Update session's last accessed timestamp in the database.
-
-                            Refreshes the last_accessed field for an active session to
-                            prevent it from being cleaned up as expired. This is called
-                            periodically for all local sessions with active transports.
-
-                            This inner function is designed to be run in a thread executor
-                            to avoid blocking the async event loop during database updates.
-
-                            Args:
-                                session_id: The session identifier to refresh (default from closure).
-
-                            Returns:
-                                bool: True if the session was found and updated, False if not found.
-
-                            Raises:
-                                Exception: Any database error is re-raised after rollback.
-
-                            Examples:
-                                >>> # This function is called for each active local session
-                                >>> # Updates SessionRecord.last_accessed to current time
-                                >>> # Returns True if session exists and was refreshed
-                                >>> # Returns False if session no longer exists in database
-                            """
-                            db_session = next(get_db())
-                            try:
-                                session = db_session.query(SessionRecord).filter(SessionRecord.session_id == session_id).first()
-
-                                if session:
-                                    # Update last_accessed
-                                    session.last_accessed = func.now()  # pylint: disable=not-callable
-                                    db_session.commit()
-                                    return True
-                                return False
-                            except Exception as ex:
-                                db_session.rollback()
-                                raise ex
-                            finally:
-                                db_session.close()
-
-                        session_exists = await asyncio.to_thread(_refresh_session)
-                        if not session_exists:
-                            # Session no longer in database, remove locally
-                            await self.remove_session(session_id)
-
-                    except Exception as e:
-                        logger.error(f"Error checking session {session_id}: {e}")
+                await self._cleanup_database_sessions()
 
                 await asyncio.sleep(300)  # Run every 5 minutes
 
@@ -1162,6 +1198,92 @@ class SessionRegistry(SessionBackend):
             except Exception as e:
                 logger.error(f"Error in database cleanup task: {e}")
                 await asyncio.sleep(600)  # Sleep longer on error
+
+    def _refresh_session_db(self, session_id: str) -> bool:
+        """Update session's last accessed timestamp in the database.
+
+        Refreshes the last_accessed field for an active session to
+        prevent it from being cleaned up as expired. This is called
+        periodically for all local sessions with active transports.
+
+        Args:
+            session_id: The session identifier to refresh.
+
+        Returns:
+            bool: True if the session was found and updated, False if not found.
+
+        Raises:
+            Exception: Any database error is re-raised after rollback.
+        """
+        db_session = next(get_db())
+        try:
+            session = db_session.query(SessionRecord).filter(SessionRecord.session_id == session_id).first()
+            if session:
+                session.last_accessed = func.now()  # pylint: disable=not-callable
+                db_session.commit()
+                return True
+            return False
+        except Exception as ex:
+            db_session.rollback()
+            raise ex
+        finally:
+            db_session.close()
+
+    async def _cleanup_database_sessions(self, max_concurrent: int = 20) -> None:
+        """Parallelize session cleanup with bounded concurrency.
+
+        Checks connection status first (fast), then refreshes connected sessions
+        in parallel using asyncio.gather() with a semaphore to limit concurrent
+        DB operations and prevent resource exhaustion.
+
+        Args:
+            max_concurrent: Maximum number of concurrent DB refresh operations.
+                Defaults to 20 to balance parallelism with resource usage.
+        """
+        async with self._lock:
+            local_transports = self._sessions.copy()
+
+        # Check connections first (fast)
+        connected: list[str] = []
+        for session_id, transport in local_transports.items():
+            try:
+                if not await transport.is_connected():
+                    await self.remove_session(session_id)
+                else:
+                    connected.append(session_id)
+            except Exception as e:
+                # Only log error, don't remove session on transient errors
+                logger.error(f"Error checking connection for session {session_id}: {e}")
+
+        # Parallel refresh of connected sessions with bounded concurrency
+        if connected:
+            semaphore = asyncio.Semaphore(max_concurrent)
+
+            async def bounded_refresh(session_id: str) -> bool:
+                """Refresh session with semaphore-bounded concurrency.
+
+                Args:
+                    session_id: The session ID to refresh.
+
+                Returns:
+                    True if refresh succeeded, False otherwise.
+                """
+                async with semaphore:
+                    return await asyncio.to_thread(self._refresh_session_db, session_id)
+
+            refresh_tasks = [bounded_refresh(session_id) for session_id in connected]
+            results = await asyncio.gather(*refresh_tasks, return_exceptions=True)
+
+            for session_id, result in zip(connected, results):
+                try:
+                    if isinstance(result, Exception):
+                        # Only log error, don't remove session on transient DB errors
+                        logger.error(f"Error refreshing session {session_id}: {result}")
+                    elif not result:
+                        # Session no longer in database, remove locally
+                        await self.remove_session(session_id)
+                except Exception as e:
+                    logger.error(f"Error processing refresh result for session {session_id}: {e}")
 
     async def _memory_cleanup_task(self) -> None:
         """Background task to clean up disconnected sessions in memory backend.
@@ -1195,8 +1317,53 @@ class SessionRegistry(SessionBackend):
                 logger.error(f"Error in memory cleanup task: {e}")
                 await asyncio.sleep(300)  # Sleep longer on error
 
+    def _get_oauth_experimental_config(self, server_id: str) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Query OAuth configuration for a server (synchronous, run in threadpool).
+
+        This method queries the database for OAuth configuration and returns
+        RFC 9728-safe fields for advertising in MCP capabilities.
+
+        Args:
+            server_id: The server ID to query OAuth configuration for.
+
+        Returns:
+            Dict with 'oauth' key containing safe OAuth config, or None if not configured.
+        """
+        # First-Party
+        from mcpgateway.db import Server as DbServer  # pylint: disable=import-outside-toplevel
+        from mcpgateway.db import SessionLocal  # pylint: disable=import-outside-toplevel
+
+        db = SessionLocal()
+        try:
+            server = db.get(DbServer, server_id)
+            if server and getattr(server, "oauth_enabled", False) and getattr(server, "oauth_config", None):
+                # Filter oauth_config to RFC 9728-safe fields only (never expose secrets)
+                oauth_config = server.oauth_config
+                safe_oauth: Dict[str, Any] = {}
+
+                # Extract authorization servers
+                if oauth_config.get("authorization_servers"):
+                    safe_oauth["authorization_servers"] = oauth_config["authorization_servers"]
+                elif oauth_config.get("authorization_server"):
+                    safe_oauth["authorization_servers"] = [oauth_config["authorization_server"]]
+
+                # Extract scopes
+                scopes = oauth_config.get("scopes_supported") or oauth_config.get("scopes")
+                if scopes:
+                    safe_oauth["scopes_supported"] = scopes
+
+                # Add bearer methods
+                safe_oauth["bearer_methods_supported"] = oauth_config.get("bearer_methods_supported", ["header"])
+
+                if safe_oauth.get("authorization_servers"):
+                    logger.debug(f"Advertising OAuth capability for server {server_id}")
+                    return {"oauth": safe_oauth}
+            return None
+        finally:
+            db.close()
+
     # Handle initialize logic
-    async def handle_initialize_logic(self, body: Dict[str, Any], session_id: Optional[str] = None) -> InitializeResult:
+    async def handle_initialize_logic(self, body: Dict[str, Any], session_id: Optional[str] = None, server_id: Optional[str] = None) -> InitializeResult:
         """Process MCP protocol initialization request.
 
         Validates the protocol version and returns server capabilities and information.
@@ -1206,6 +1373,7 @@ class SessionRegistry(SessionBackend):
             body: Request body containing protocol_version and optional client_info.
                 Expected keys: 'protocol_version' or 'protocolVersion', 'capabilities'.
             session_id: Optional session ID to associate client capabilities with.
+            server_id: Optional server ID to query OAuth configuration for RFC 9728 support.
 
         Returns:
             InitializeResult containing protocol version, server capabilities, and server info.
@@ -1251,6 +1419,17 @@ class SessionRegistry(SessionBackend):
             await self.store_client_capabilities(session_id, client_capabilities)
             logger.debug(f"Stored capabilities for session {session_id}: {client_capabilities}")
 
+        # Build experimental capabilities (including OAuth if configured)
+        experimental: Optional[Dict[str, Dict[str, Any]]] = None
+
+        # Query OAuth configuration if server_id is provided
+        if server_id:
+            try:
+                # Run synchronous DB query in threadpool to avoid blocking the event loop
+                experimental = await asyncio.to_thread(self._get_oauth_experimental_config, server_id)
+            except Exception as e:
+                logger.warning(f"Failed to query OAuth config for server {server_id}: {e}")
+
         return InitializeResult(
             protocolVersion=protocol_version,
             capabilities=ServerCapabilities(
@@ -1259,6 +1438,7 @@ class SessionRegistry(SessionBackend):
                 tools={"listChanged": True},
                 logging={},
                 completions={},  # Advertise completions capability per MCP spec
+                experimental=experimental,  # OAuth capability when configured
             ),
             serverInfo=Implementation(name=settings.app_name, version=__version__),
             instructions=("MCP Gateway providing federated tools, resources and prompts. Use /admin interface for configuration."),
@@ -1361,15 +1541,17 @@ class SessionRegistry(SessionBackend):
                 "id": req_id,
             }
             # Get the token from the current authentication context
-            # The user object doesn't contain the token directly, we need to reconstruct it
-            # Since we don't have access to the original headers here, we need a different approach
-            # We'll extract the token from the session or create a new admin token
+            # The user object should contain auth_token, token_teams, and is_admin from the SSE endpoint
             token = None
+            token_teams = user.get("token_teams", [])  # Default to empty list, never None
+            is_admin = user.get("is_admin", False)  # Preserve admin status from SSE endpoint
+
             try:
-                if hasattr(user, "get") and "auth_token" in user:
+                if hasattr(user, "get") and user.get("auth_token"):
                     token = user["auth_token"]
                 else:
-                    # Fallback: create an admin token for internal RPC calls
+                    # Fallback: create token preserving the user's context (including admin status)
+                    logger.warning("No auth token available for SSE RPC call - creating fallback token")
                     now = datetime.now(timezone.utc)
                     payload = {
                         "sub": user.get("email", "system"),
@@ -1377,10 +1559,11 @@ class SessionRegistry(SessionBackend):
                         "aud": settings.jwt_audience,
                         "iat": int(now.timestamp()),
                         "jti": str(uuid.uuid4()),
+                        "teams": token_teams,  # Always a list - preserves token scope
                         "user": {
                             "email": user.get("email", "system"),
                             "full_name": user.get("full_name", "System"),
-                            "is_admin": True,  # Internal calls should have admin access
+                            "is_admin": is_admin,  # Preserve admin status for cookie-authenticated admins
                             "auth_provider": "internal",
                         },
                     }

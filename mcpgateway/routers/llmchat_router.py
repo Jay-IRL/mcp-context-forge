@@ -7,8 +7,9 @@ Authors: Keval Mahajan
 LLM Chat Router Module
 
 This module provides FastAPI endpoints for managing LLM-based chat sessions
-with MCP (Model Context Protocol) server integration. It supports multiple
-LLM providers including Azure OpenAI, OpenAI, Anthropic, AWS Bedrock, and Ollama.
+with MCP (Model Context Protocol) server integration. LLM providers are
+configured via the Admin UI's LLM Settings and accessed through the gateway
+provider.
 
 The module handles user session management, configuration, and real-time
 streaming responses for conversational AI applications with unified chat
@@ -18,50 +19,54 @@ history management via ChatHistoryManager from mcp_client_chat_service.
 
 # Standard
 import asyncio
-import json
 import os
 from typing import Any, Dict, Optional
 
 # Third-Party
-from dotenv import load_dotenv
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+import orjson
+from pydantic import BaseModel, Field
 
 try:
     # Third-Party
-    import redis.asyncio as aioredis
+    import redis.asyncio  # noqa: F401 - availability check only
+
+    REDIS_AVAILABLE = True
 except ImportError:
-    aioredis = None
+    REDIS_AVAILABLE = False
 
 # First-Party
 from mcpgateway.config import settings
+from mcpgateway.middleware.rbac import get_current_user_with_permissions
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.services.mcp_client_chat_service import (
-    AnthropicConfig,
-    AWSBedrockConfig,
-    AzureOpenAIConfig,
+    GatewayConfig,
     LLMConfig,
     MCPChatService,
     MCPClientConfig,
     MCPServerConfig,
-    OllamaConfig,
-    OpenAIConfig,
-    WatsonxConfig,
 )
-
-# Load environment variables
-load_dotenv()
+from mcpgateway.utils.redis_client import get_redis_client
 
 # Initialize router
 llmchat_router = APIRouter(prefix="/llmchat", tags=["llmchat"])
 
-# Redis client initialization
+# Redis client (initialized via init_redis() during app startup)
 redis_client = None
-if getattr(settings, "cache_type", None) == "redis" and getattr(settings, "redis_url", None):
-    if aioredis is None:
-        raise RuntimeError("Redis support requires 'redis' package. Install with: pip install redis[async]")
-    redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
+
+
+async def init_redis() -> None:
+    """Initialize Redis client using the shared factory.
+
+    Should be called during application startup from main.py lifespan.
+    """
+    global redis_client
+    if getattr(settings, "cache_type", None) == "redis" and getattr(settings, "redis_url", None):
+        redis_client = await get_redis_client()
+        if redis_client:
+            logger.info("LLMChat router connected to shared Redis client")
+
 
 # Fallback in-memory stores (used when Redis unavailable)
 # Store active chat sessions per user
@@ -74,71 +79,33 @@ user_configs: Dict[str, MCPClientConfig] = {}
 logging_service = LoggingService()
 logger = logging_service.get_logger(__name__)
 
-# ---------- Utility ----------
-
-
-def fallback(value, env_var_name: str, default: Optional[Any] = None):
-    """Return the provided value or fall back to environment variable or default.
-
-    This utility function implements a cascading fallback mechanism for configuration
-    values, checking the provided value first, then environment variables, and finally
-    a default value.
-
-    Args:
-        value: The primary value to use if not None.
-        env_var_name: Name of the environment variable to check as fallback.
-        default: Default value to return if both value and env var are None/empty.
-
-    Returns:
-        The first non-None value from: value, environment variable, or default.
-
-    Examples:
-        >>> import os
-        >>> os.environ['TEST_VAR'] = 'env_value'
-        >>> fallback('direct_value', 'TEST_VAR', 'default')
-        'direct_value'
-
-        >>> fallback(None, 'TEST_VAR', 'default')
-        'env_value'
-
-        >>> fallback(None, 'NONEXISTENT_VAR', 'default')
-        'default'
-
-        >>> fallback(None, 'NONEXISTENT_VAR')
-
-    Note:
-        Environment variables are retrieved using os.getenv(), which returns
-        None if the variable doesn't exist.
-    """
-    return value if value is not None else os.getenv(env_var_name, default)
-
-
 # ---------- MODELS ----------
 
 
 class LLMInput(BaseModel):
-    """Input configuration for Language Learning Model providers.
+    """Input configuration for LLM provider selection.
 
-    This model encapsulates the provider type and associated configuration
-    parameters for initializing LLM connections.
+    This model specifies which gateway-configured model to use.
+    Models must be configured via Admin UI -> LLM Settings.
 
     Attributes:
-        provider: LLM provider identifier (e.g., 'azure_openai', 'openai', 'ollama').
-        config: Dictionary containing provider-specific configuration parameters
-                such as API keys, endpoints, models, and temperature settings.
+        model: Model ID from the gateway's LLM Settings (UUID or model_id).
+        temperature: Optional sampling temperature (0.0-2.0).
+        max_tokens: Optional maximum tokens to generate.
 
     Examples:
-        >>> llm_input = LLMInput(provider='azure_openai', config={'api_key': 'test_key'})
-        >>> llm_input.provider
-        'azure_openai'
+        >>> llm_input = LLMInput(model='gpt-4o')
+        >>> llm_input.model
+        'gpt-4o'
 
-        >>> llm_input = LLMInput(provider='ollama')
-        >>> llm_input.config
-        {}
+        >>> llm_input = LLMInput(model='abc123-uuid', temperature=0.5)
+        >>> llm_input.temperature
+        0.5
     """
 
-    provider: str
-    config: Dict[str, Any] = {}
+    model: str = Field(..., description="Model ID from gateway LLM Settings (UUID or model_id)")
+    temperature: Optional[float] = Field(None, ge=0.0, le=2.0, description="Sampling temperature")
+    max_tokens: Optional[int] = Field(None, gt=0, description="Maximum tokens to generate")
 
 
 class ServerInput(BaseModel):
@@ -177,22 +144,22 @@ class ConnectInput(BaseModel):
     Attributes:
         user_id: Unique identifier for the user session. Required for session management.
         server: Optional MCP server configuration. Uses defaults if not provided.
-        llm: Optional LLM provider configuration. Uses environment defaults if not provided.
+        llm: LLM configuration specifying which gateway model to use. Required.
         streaming: Whether to enable streaming responses. Defaults to False.
 
     Examples:
-        >>> connect = ConnectInput(user_id='user123')
+        >>> connect = ConnectInput(user_id='user123', llm=LLMInput(model='gpt-4o'))
         >>> connect.streaming
         False
 
-        >>> connect = ConnectInput(user_id='user456', streaming=True)
+        >>> connect = ConnectInput(user_id='user456', llm=LLMInput(model='gpt-4o'), streaming=True)
         >>> connect.user_id
         'user456'
     """
 
     user_id: str
     server: Optional[ServerInput] = None
-    llm: Optional[LLMInput] = None
+    llm: LLMInput = Field(..., description="LLM configuration with model from gateway LLM Settings")
     streaming: bool = False
 
 
@@ -241,184 +208,44 @@ class DisconnectInput(BaseModel):
 # ---------- HELPERS ----------
 
 
-def build_llm_config(llm: Optional[LLMInput]) -> LLMConfig:
-    """Construct an LLMConfig object from input parameters and environment variables.
+def build_llm_config(llm: LLMInput) -> LLMConfig:
+    """Construct an LLMConfig object from input parameters.
 
-    This function builds a complete LLM configuration by combining explicit input
-    parameters with environment variable fallbacks. It validates required fields
-    and constructs provider-specific configuration objects.
+    Creates a gateway provider configuration that routes requests through
+    the gateway's LLM Settings. Models must be configured via Admin UI.
 
     Args:
-        llm: Optional LLMInput containing provider type and configuration parameters.
-             If None, defaults are retrieved from environment variables.
+        llm: LLMInput containing model ID and optional temperature/max_tokens.
 
     Returns:
-        LLMConfig: Fully configured LLM configuration object with provider-specific settings.
-
-    Raises:
-        ValueError: If the provider is unsupported, or if required credentials
-                   (API keys, endpoints) are missing for the specified provider.
-
-    Supported Providers:
-        - azure_openai: Requires api_key and azure_endpoint
-        - openai: Requires api_key
-        - anthropic: Requires api_key
-        - aws_bedrock: Requires model_id
-        - ollama: Requires model name
+        LLMConfig: Gateway provider configuration.
 
     Examples:
-        >>> import os
-        >>> os.environ['LLM_PROVIDER'] = 'ollama'
-        >>> os.environ['OLLAMA_MODEL'] = 'llama3'
-        >>> config = build_llm_config(None)
+        >>> llm_input = LLMInput(model='gpt-4o')
+        >>> config = build_llm_config(llm_input)
         >>> config.provider
-        'ollama'
-
-        >>> llm_input = LLMInput(provider='invalid_provider')
-        >>> build_llm_config(llm_input)
-        Traceback (most recent call last):
-        ...
-        ValueError: Unsupported LLM provider: invalid_provider...
+        'gateway'
 
     Note:
-        API keys and sensitive credentials are retrieved from environment variables
-        for security. Never hardcode credentials in the configuration dict.
+        All LLM configuration is done via Admin UI -> Settings -> LLM Settings.
+        The gateway provider looks up models from the database and creates
+        the appropriate LLM instance based on provider type.
     """
-    provider = fallback(llm.provider if llm else None, "LLM_PROVIDER", "azure_openai")
-    cfg = llm.config if llm else {}
-
-    # Validate provider
-    valid_providers = ["azure_openai", "openai", "anthropic", "aws_bedrock", "ollama", "watsonx"]
-    if provider not in valid_providers:
-        raise ValueError(f"Unsupported LLM provider: {provider}. Supported providers: {', '.join(valid_providers)}")
-
-    if provider == "azure_openai":
-        # Validate required fields
-        api_key = fallback(cfg.get("api_key"), "AZURE_OPENAI_API_KEY")
-        azure_endpoint = fallback(cfg.get("azure_endpoint"), "AZURE_OPENAI_ENDPOINT")
-
-        if not api_key:
-            raise ValueError("Azure OpenAI API key is required but not provided")
-        if not azure_endpoint:
-            raise ValueError("Azure OpenAI endpoint is required but not provided")
-
-        return LLMConfig(
-            provider="azure_openai",
-            config=AzureOpenAIConfig(
-                api_key=api_key,
-                azure_endpoint=azure_endpoint,
-                api_version=fallback(cfg.get("api_version"), "AZURE_OPENAI_API_VERSION", "2024-05-01-preview"),
-                azure_deployment=fallback(cfg.get("azure_deployment"), "AZURE_OPENAI_DEPLOYMENT", "gpt-4"),
-                model=fallback(cfg.get("model"), "AZURE_OPENAI_MODEL", "gpt-4"),
-                temperature=fallback(cfg.get("temperature"), "AZURE_OPENAI_TEMPERATURE", 0.7),
-            ),
-        )
-
-    elif provider == "openai":
-        api_key = fallback(cfg.get("api_key"), "OPENAI_API_KEY")
-
-        if not api_key:
-            raise ValueError("OpenAI API key is required but not provided")
-
-        return LLMConfig(
-            provider="openai",
-            config=OpenAIConfig(
-                api_key=api_key,
-                model=fallback(cfg.get("model"), "OPENAI_MODEL", "gpt-4o-mini"),
-                temperature=fallback(cfg.get("temperature"), "OPENAI_TEMPERATURE", 0.7),
-                base_url=fallback(cfg.get("base_url"), "OPENAI_BASE_URL"),
-                max_tokens=cfg.get("max_tokens"),
-                timeout=cfg.get("timeout"),
-                max_retries=fallback(cfg.get("max_retries"), "OPENAI_MAX_RETRIES", 2),
-            ),
-        )
-
-    elif provider == "anthropic":
-        api_key = fallback(cfg.get("api_key"), "ANTHROPIC_API_KEY")
-
-        if not api_key:
-            raise ValueError("Anthropic API key is required but not provided")
-
-        return LLMConfig(
-            provider="anthropic",
-            config=AnthropicConfig(
-                api_key=api_key,
-                model=fallback(cfg.get("model"), "ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
-                temperature=fallback(cfg.get("temperature"), "ANTHROPIC_TEMPERATURE", 0.7),
-                max_tokens=fallback(cfg.get("max_tokens"), "ANTHROPIC_MAX_TOKENS", 4096),
-                timeout=cfg.get("timeout"),
-                max_retries=fallback(cfg.get("max_retries"), "ANTHROPIC_MAX_RETRIES", 2),
-            ),
-        )
-
-    elif provider == "aws_bedrock":
-        model_id = fallback(cfg.get("model_id"), "AWS_BEDROCK_MODEL_ID")
-
-        if not model_id:
-            raise ValueError("AWS Bedrock model_id is required but not provided")
-
-        return LLMConfig(
-            provider="aws_bedrock",
-            config=AWSBedrockConfig(
-                model_id=model_id,
-                region_name=fallback(cfg.get("region_name"), "AWS_BEDROCK_REGION", "us-east-1"),
-                aws_access_key_id=fallback(cfg.get("aws_access_key_id"), "AWS_ACCESS_KEY_ID"),
-                aws_secret_access_key=fallback(cfg.get("aws_secret_access_key"), "AWS_SECRET_ACCESS_KEY"),
-                aws_session_token=fallback(cfg.get("aws_session_token"), "AWS_SESSION_TOKEN"),
-                temperature=fallback(cfg.get("temperature"), "AWS_BEDROCK_TEMPERATURE", 0.7),
-                max_tokens=fallback(cfg.get("max_tokens"), "AWS_BEDROCK_MAX_TOKENS", 4096),
-            ),
-        )
-
-    elif provider == "ollama":
-        model = fallback(cfg.get("model"), "OLLAMA_MODEL", "llama3")
-
-        if not model:
-            raise ValueError("Ollama model name is required but not provided")
-
-        return LLMConfig(
-            provider="ollama",
-            config=OllamaConfig(
-                model=model,
-                temperature=fallback(cfg.get("temperature"), "OLLAMA_TEMPERATURE", 0.7),
-                base_url=fallback(cfg.get("base_url"), "OLLAMA_BASE_URL", "http://localhost:11434"),
-                timeout=cfg.get("timeout"),
-                num_ctx=cfg.get("num_ctx"),
-            ),
-        )
-
-    elif provider == "watsonx":
-        apikey = fallback(cfg.get("apikey"), "WATSONX_APIKEY")
-        project_id = fallback(cfg.get("projectid"), "WATSONX_PROJECT_ID")
-
-        if not apikey:
-            raise ValueError("IBM watsonx.ai API key is required but not provided")
-        if not project_id:
-            raise ValueError("IBM watsonx.ai project ID is required but not provided")
-
-        return LLMConfig(
-            provider="watsonx",
-            config=WatsonxConfig(
-                apikey=apikey,
-                url=fallback(cfg.get("url"), "WATSONX_URL", "https://us-south.ml.cloud.ibm.com"),
-                project_id=project_id,
-                model_id=fallback(cfg.get("model_id"), "WATSONX_MODEL_ID", "ibm/granite-13b-chat-v2"),
-                temperature=fallback(cfg.get("temperature"), "WATSONX_TEMPERATURE", 0.7),
-                max_new_tokens=cfg.get("max_tokens", 1024),
-                min_new_tokens=cfg.get("min_tokens", 1),
-                decoding_method=fallback(cfg.get("decoding_method"), "WATSONX_DECODING_METHOD", "sample"),
-                top_k=cfg.get("top_k", 50),
-                top_p=cfg.get("top_p", 1.0),
-                timeout=cfg.get("timeout"),
-            ),
-        )
+    return LLMConfig(
+        provider="gateway",
+        config=GatewayConfig(
+            model=llm.model,
+            temperature=llm.temperature if llm.temperature is not None else 0.7,
+            max_tokens=llm.max_tokens,
+        ),
+    )
 
 
 def build_config(input_data: ConnectInput) -> MCPClientConfig:
     """Build complete MCP client configuration from connection input.
 
     Constructs a comprehensive configuration object combining MCP server settings
-    and LLM configuration, with environment variable fallbacks for missing values.
+    and LLM configuration.
 
     Args:
         input_data: ConnectInput object containing server, LLM, and streaming settings.
@@ -426,35 +253,63 @@ def build_config(input_data: ConnectInput) -> MCPClientConfig:
     Returns:
         MCPClientConfig: Complete client configuration ready for service initialization.
 
-    Raises:
-        ValueError: If LLM configuration validation fails (propagated from build_llm_config).
-
     Examples:
-        >>> import os
-        >>> os.environ['MCP_SERVER_URL'] = 'http://test.com/mcp'
-        >>> os.environ['LLM_PROVIDER'] = 'ollama'
-        >>> os.environ['OLLAMA_MODEL'] = 'llama3'
-        >>> connect = ConnectInput(user_id='user123')
+        >>> from mcpgateway.routers.llmchat_router import ConnectInput, LLMInput, build_config
+        >>> connect = ConnectInput(user_id='user123', llm=LLMInput(model='gpt-4o'))
         >>> config = build_config(connect)
         >>> config.mcp_server.transport
         'streamable_http'
 
     Note:
-        This function orchestrates the creation of nested configuration objects
-        for both server and LLM components.
+        MCP server settings use defaults if not provided.
+        LLM configuration routes through the gateway provider.
     """
     server = input_data.server
-    llm = input_data.llm
 
     return MCPClientConfig(
         mcp_server=MCPServerConfig(
-            url=fallback(server.url if server else None, "MCP_SERVER_URL", "http://localhost:8000/mcp"),
-            transport=fallback(server.transport if server else None, "MCP_SERVER_TRANSPORT", "streamable_http"),
-            auth_token=fallback(server.auth_token if server else None, "MCP_SERVER_AUTH_TOKEN"),
+            url=server.url if server and server.url else "http://localhost:8000/mcp",
+            transport=server.transport if server and server.transport else "streamable_http",
+            auth_token=server.auth_token if server else None,
         ),
-        llm=build_llm_config(llm),
+        llm=build_llm_config(input_data.llm),
         enable_streaming=input_data.streaming,
     )
+
+
+def _get_user_id_from_context(user: Dict[str, Any]) -> str:
+    """Extract a stable user identifier from the authenticated user context.
+
+    Args:
+        user: Authenticated user context from RBAC dependency.
+
+    Returns:
+        User identifier string or "unknown" if missing.
+    """
+    if isinstance(user, dict):
+        return user.get("id") or user.get("user_id") or user.get("sub") or user.get("email") or "unknown"
+    return "unknown" if user is None else str(getattr(user, "id", user))
+
+
+def _resolve_user_id(input_user_id: Optional[str], user: Dict[str, Any]) -> str:
+    """Resolve the authenticated user ID and reject mismatched requests.
+
+    Args:
+        input_user_id: User ID provided by the client (optional).
+        user: Authenticated user context from RBAC dependency.
+
+    Returns:
+        Resolved authenticated user identifier.
+
+    Raises:
+        HTTPException: When authentication is missing or user ID mismatches.
+    """
+    user_id = _get_user_id_from_context(user)
+    if user_id == "unknown":
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    if input_user_id and input_user_id != user_id:
+        raise HTTPException(status_code=403, detail="User ID mismatch.")
+    return user_id
 
 
 # ---------- SESSION STORAGE HELPERS ----------
@@ -517,7 +372,7 @@ async def set_user_config(user_id: str, config: MCPClientConfig):
         config: Complete MCP client configuration.
     """
     if redis_client:
-        await redis_client.set(_cfg_key(user_id), json.dumps(config.model_dump()))
+        await redis_client.set(_cfg_key(user_id), orjson.dumps(config.model_dump()))
     else:
         user_configs[user_id] = config
 
@@ -535,7 +390,7 @@ async def get_user_config(user_id: str) -> Optional[MCPClientConfig]:
         data = await redis_client.get(_cfg_key(user_id))
         if not data:
             return None
-        return MCPClientConfig(**json.loads(data))
+        return MCPClientConfig(**orjson.loads(data))
     return user_configs.get(user_id)
 
 
@@ -568,14 +423,29 @@ async def set_active_session(user_id: str, session: MCPChatService):
 
 
 async def delete_active_session(user_id: str):
-    """Remove active session locally and from Redis.
+    """Remove active session locally and from Redis atomically.
+
+    Uses a Lua script to ensure we only delete the Redis key if we own it,
+    preventing race conditions where another worker's session marker could
+    be deleted if our session expired and was recreated by another worker.
 
     Args:
         user_id: User identifier.
     """
     active_sessions.pop(user_id, None)
     if redis_client:
-        await redis_client.delete(_active_key(user_id))
+        try:
+            # Lua script for atomic check-and-delete (only delete if we own the key)
+            release_script = """
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+            else
+                return 0
+            end
+            """
+            await redis_client.eval(release_script, 1, _active_key(user_id), WORKER_ID)
+        except Exception as e:
+            logger.warning(f"Failed to delete active session for user {user_id}: {e}")
 
 
 async def _try_acquire_lock(user_id: str) -> bool:
@@ -593,16 +463,29 @@ async def _try_acquire_lock(user_id: str) -> bool:
 
 
 async def _release_lock_safe(user_id: str):
-    """Release the lock only if we own it (best-effort).
+    """Release the lock atomically only if we own it.
+
+    Uses a Lua script to ensure atomic check-and-delete, preventing
+    the TOCTOU race condition where another worker's lock could be
+    deleted if the original lock expired between get() and delete().
 
     Args:
         user_id: User identifier.
     """
     if not redis_client:
         return
-    val = await redis_client.get(_lock_key(user_id))
-    if val == WORKER_ID:
-        await redis_client.delete(_lock_key(user_id))
+    try:
+        # Lua script for atomic check-and-delete (only delete if we own the key)
+        release_script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        else
+            return 0
+        end
+        """
+        await redis_client.eval(release_script, 1, _lock_key(user_id), WORKER_ID)
+    except Exception as e:
+        logger.warning(f"Failed to release lock for user {user_id}: {e}")
 
 
 async def _create_local_session_from_config(user_id: str) -> Optional[MCPChatService]:
@@ -727,7 +610,7 @@ async def get_active_session(user_id: str) -> Optional[MCPChatService]:
 
 
 @llmchat_router.post("/connect")
-async def connect(input_data: ConnectInput, request: Request):
+async def connect(input_data: ConnectInput, request: Request, user=Depends(get_current_user_with_permissions)):
     """Create or refresh a chat session for a user.
 
     Initializes a new MCPChatService instance for the specified user, establishing
@@ -740,6 +623,7 @@ async def connect(input_data: ConnectInput, request: Request):
     Args:
         input_data: ConnectInput containing user_id, optional server/LLM config, and streaming preference.
         request: FastAPI Request object for accessing cookies and headers.
+        user: Authenticated user context.
 
     Returns:
         dict: Connection status response containing:
@@ -787,7 +671,7 @@ async def connect(input_data: ConnectInput, request: Request):
         Existing sessions are automatically terminated before establishing new ones.
         All configuration values support environment variable fallbacks.
     """
-    user_id = input_data.user_id
+    user_id = _resolve_user_id(input_data.user_id, user)
 
     try:
         # Validate user_id
@@ -918,6 +802,65 @@ async def token_streamer(chat_service: MCPChatService, message: str, user_id: st
         All exceptions are caught and converted to error events for client handling.
     """
 
+    def json_default(obj):
+        """
+        Default JSON serializer helper for non-serializable Python objects.
+
+        Intended for use as the `default` parameter of `json.dumps`. The
+        function tries common serialization patterns in the following order:
+
+        1. model_dump() for Pydantic v2 models
+        2. dict() for Pydantic v1 models
+        3. __dict__ for plain Python objects
+        4. Fallback to str(obj)
+
+        Args:
+            obj: An object that is not JSON serializable by default.
+
+        Returns:
+            A JSON-serializable representation of ``obj``.
+
+        Examples:
+            >>> class Simple:
+            ...     def __init__(self):
+            ...         self.x = 1
+            ...         self.y = 2
+            ...
+            >>> json_default(Simple())
+            {'x': 1, 'y': 2}
+
+            >>> class WithStr:
+            ...     def __str__(self):
+            ...         return "custom"
+            ...
+            >>> json_default(WithStr())
+            'custom'
+
+            >>> class PydanticV1Like:
+            ...     def dict(self):
+            ...         return {"a": 1}
+            ...
+            >>> json_default(PydanticV1Like())
+            {'a': 1}
+
+            >>> class PydanticV2Like:
+            ...     def model_dump(self):
+            ...         return {"b": 2}
+            ...
+            >>> json_default(PydanticV2Like())
+            {'b': 2}
+        """
+        # Try common patterns first
+        if hasattr(obj, "model_dump"):  # pydantic v2
+            return obj.model_dump()
+        if hasattr(obj, "dict"):  # pydantic v1
+            return obj.dict()
+        if hasattr(obj, "__dict__"):
+            return obj.__dict__
+
+        # Fallback: string representation
+        return str(obj)
+
     async def sse(event_type: str, data: Dict[str, Any]):
         """Format data as Server-Sent Event.
 
@@ -929,7 +872,7 @@ async def token_streamer(chat_service: MCPChatService, message: str, user_id: st
             bytes: UTF-8 encoded SSE formatted lines.
         """
         yield f"event: {event_type}\n".encode("utf-8")
-        yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+        yield f"data: {orjson.dumps(data).decode()}\n\n".encode("utf-8")
 
     try:
         async for ev in chat_service.chat_events(message):
@@ -965,7 +908,7 @@ async def token_streamer(chat_service: MCPChatService, message: str, user_id: st
 
 
 @llmchat_router.post("/chat")
-async def chat(input_data: ChatInput):
+async def chat(input_data: ChatInput, user=Depends(get_current_user_with_permissions)):
     """Send a message to the user's active chat session and receive a response.
 
     Processes user messages through the configured LLM with MCP tool integration.
@@ -974,6 +917,7 @@ async def chat(input_data: ChatInput):
 
     Args:
         input_data: ChatInput containing user_id, message, and streaming preference.
+        user: Authenticated user context.
 
     Returns:
         For streaming=False:
@@ -1028,7 +972,7 @@ async def chat(input_data: ChatInput):
         Streaming responses use Server-Sent Events (SSE) with 'text/event-stream' MIME type.
         Client must maintain persistent connection for streaming.
     """
-    user_id = input_data.user_id
+    user_id = _resolve_user_id(input_data.user_id, user)
 
     # Validate input
     if not user_id:
@@ -1080,7 +1024,7 @@ async def chat(input_data: ChatInput):
 
 
 @llmchat_router.post("/disconnect")
-async def disconnect(input_data: DisconnectInput):
+async def disconnect(input_data: DisconnectInput, user=Depends(get_current_user_with_permissions)):
     """End the chat session for a user and clean up resources.
 
     Gracefully shuts down the MCPChatService instance, closes connections,
@@ -1089,6 +1033,7 @@ async def disconnect(input_data: DisconnectInput):
 
     Args:
         input_data: DisconnectInput containing the user_id to disconnect.
+        user: Authenticated user context.
 
     Returns:
         dict: Disconnection status containing:
@@ -1130,7 +1075,7 @@ async def disconnect(input_data: DisconnectInput):
         This operation is idempotent - calling it multiple times for the same
         user_id is safe and will not raise errors.
     """
-    user_id = input_data.user_id
+    user_id = _resolve_user_id(input_data.user_id, user)
 
     if not user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
@@ -1159,7 +1104,7 @@ async def disconnect(input_data: DisconnectInput):
 
 
 @llmchat_router.get("/status/{user_id}")
-async def status(user_id: str):
+async def status(user_id: str, user=Depends(get_current_user_with_permissions)):
     """Check if an active chat session exists for the specified user.
 
     Lightweight endpoint for verifying session state without modifying data.
@@ -1167,6 +1112,7 @@ async def status(user_id: str):
 
     Args:
         user_id: User identifier to check session status for.
+        user: Authenticated user context.
 
     Returns:
         dict: Status information containing:
@@ -1197,12 +1143,13 @@ async def status(user_id: str):
         This endpoint does not validate that the session is properly initialized,
         only that it exists in the active_sessions dictionary.
     """
-    connected = bool(await get_active_session(user_id))
-    return {"user_id": user_id, "connected": connected}
+    resolved_user_id = _resolve_user_id(user_id, user)
+    connected = bool(await get_active_session(resolved_user_id))
+    return {"user_id": resolved_user_id, "connected": connected}
 
 
 @llmchat_router.get("/config/{user_id}")
-async def get_config(user_id: str):
+async def get_config(user_id: str, user=Depends(get_current_user_with_permissions)):
     """Retrieve the stored configuration for a user's session.
 
     Returns sanitized configuration data with sensitive information (API keys,
@@ -1211,6 +1158,7 @@ async def get_config(user_id: str):
 
     Args:
         user_id: User identifier whose configuration to retrieve.
+        user: Authenticated user context.
 
     Returns:
         dict: Sanitized configuration dictionary containing:
@@ -1250,7 +1198,8 @@ async def get_config(user_id: str):
         API keys and authentication tokens are explicitly removed before returning.
         Never log or expose these values in responses.
     """
-    config = await get_user_config(user_id)
+    resolved_user_id = _resolve_user_id(user_id, user)
+    config = await get_user_config(resolved_user_id)
 
     if not config:
         raise HTTPException(status_code=404, detail="No config found for this user.")
@@ -1263,3 +1212,62 @@ async def get_config(user_id: str):
         config_dict["llm"]["config"].pop("auth_token", None)
 
     return config_dict
+
+
+@llmchat_router.get("/gateway/models")
+async def get_gateway_models(_user=Depends(get_current_user_with_permissions)):
+    """Get available models from configured LLM providers.
+
+    Returns a list of enabled models from enabled providers configured
+    in the gateway's LLM Settings. These models can be used with the
+    "gateway" provider type in /connect requests.
+
+    Returns:
+        dict: Response containing:
+            - models: List of available models with provider info
+            - count: Total number of available models
+
+    Examples:
+        GET /llmchat/gateway/models
+
+        Response:
+        {
+            "models": [
+                {
+                    "id": "abc123",
+                    "model_id": "gpt-4o",
+                    "model_name": "GPT-4o",
+                    "provider_id": "def456",
+                    "provider_name": "OpenAI",
+                    "provider_type": "openai",
+                    "supports_streaming": true,
+                    "supports_function_calling": true,
+                    "supports_vision": true
+                }
+            ],
+            "count": 1
+        }
+
+    Raises:
+        HTTPException: If there is an error retrieving gateway models.
+
+    Args:
+        _user: Authenticated user context.
+    """
+    # Import here to avoid circular dependency
+    # First-Party
+    from mcpgateway.db import SessionLocal
+    from mcpgateway.services.llm_provider_service import LLMProviderService
+
+    llm_service = LLMProviderService()
+
+    try:
+        with SessionLocal() as db:
+            models = llm_service.get_gateway_models(db)
+            return {
+                "models": [m.model_dump() for m in models],
+                "count": len(models),
+            }
+    except Exception as e:
+        logger.error(f"Failed to get gateway models: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve gateway models: {str(e)}")

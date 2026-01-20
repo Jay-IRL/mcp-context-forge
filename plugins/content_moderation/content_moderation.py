@@ -13,16 +13,17 @@ from __future__ import annotations
 
 # Standard
 from enum import Enum
-import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
 
 # Third-Party
 import httpx
+import orjson
 from pydantic import BaseModel, Field
 
 # First-Party
+from mcpgateway.config import settings
 from mcpgateway.plugins.framework import (
     Plugin,
     PluginConfig,
@@ -185,7 +186,19 @@ class ContentModerationPlugin(Plugin):
         """
         super().__init__(config)
         self._cfg = ContentModerationConfig(**(config.config or {}))
-        self._client = httpx.AsyncClient()
+        self._client = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=settings.httpx_max_connections,
+                max_keepalive_connections=settings.httpx_max_keepalive_connections,
+                keepalive_expiry=settings.httpx_keepalive_expiry,
+            ),
+            timeout=httpx.Timeout(
+                connect=settings.httpx_connect_timeout,
+                read=settings.httpx_read_timeout,
+                write=settings.httpx_write_timeout,
+                pool=settings.httpx_pool_timeout,
+            ),
+        )
         self._cache: Dict[str, ModerationResult] = {} if self._cfg.enable_caching else None
 
     async def _get_cache_key(self, text: str, provider: ModerationProvider) -> str:
@@ -362,8 +375,8 @@ Respond with JSON format:
 
             # Parse JSON response from Granite
             try:
-                categories = json.loads(response_text)
-            except json.JSONDecodeError:
+                categories = orjson.loads(response_text)
+            except orjson.JSONDecodeError:
                 # Fallback parsing if JSON is not perfect
                 categories = {}
                 for cat in ModerationCategory:
@@ -788,6 +801,13 @@ Respond with JSON format:
 
         return ToolPostInvokeResult(metadata={"output_checked": True})
 
+    async def shutdown(self) -> None:
+        """Shutdown and cleanup HTTP client when plugin shuts down."""
+        client = getattr(self, "_client", None)
+        if client:
+            await client.aclose()
+            self._client = None
+
     async def __aenter__(self):
         """Async context manager entry.
 
@@ -798,5 +818,4 @@ Respond with JSON format:
 
     async def __aexit__(self, _exc_type, _exc_val, _exc_tb):
         """Async context manager exit - cleanup HTTP client."""
-        if hasattr(self, "_client"):
-            await self._client.aclose()
+        await self.shutdown()

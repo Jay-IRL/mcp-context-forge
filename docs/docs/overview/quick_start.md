@@ -112,7 +112,7 @@ Pick an install method below, generate an auth token, then walk through a real t
           -e PLATFORM_ADMIN_EMAIL=admin@example.com \
           -e PLATFORM_ADMIN_PASSWORD=changeme \
           -e PLATFORM_ADMIN_FULL_NAME="Platform Administrator" \
-          ghcr.io/ibm/mcp-context-forge:0.9.0
+          ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
         ```
 
     2. **(Optional) persist the DB**
@@ -130,7 +130,7 @@ Pick an install method below, generate an auth token, then walk through a real t
               -e PLATFORM_ADMIN_EMAIL=admin@example.com \
               -e PLATFORM_ADMIN_PASSWORD=changeme \
               -e PLATFORM_ADMIN_FULL_NAME="Platform Administrator" \
-              ghcr.io/ibm/mcp-context-forge:0.9.0
+              ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
             ```
 
         === "MySQL"
@@ -155,7 +155,7 @@ Pick an install method below, generate an auth token, then walk through a real t
               -e PLATFORM_ADMIN_EMAIL=admin@example.com \
               -e PLATFORM_ADMIN_PASSWORD=changeme \
               -e PLATFORM_ADMIN_FULL_NAME="Platform Administrator" \
-              ghcr.io/ibm/mcp-context-forge:0.9.0
+              ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
             ```
 
         === "PostgreSQL"
@@ -172,14 +172,14 @@ Pick an install method below, generate an auth token, then walk through a real t
             docker run -d --name mcpgateway \
               -p 4444:4444 \
               --link postgres-db:postgres \
-              -e DATABASE_URL=postgresql://postgres:mysecretpassword@postgres:5432/mcp \
+              -e DATABASE_URL=postgresql+psycopg://postgres:mysecretpassword@postgres:5432/mcp \
               -e JWT_SECRET_KEY=my-test-key \
               -e BASIC_AUTH_USER=admin \
               -e BASIC_AUTH_PASSWORD=changeme \
               -e PLATFORM_ADMIN_EMAIL=admin@example.com \
               -e PLATFORM_ADMIN_PASSWORD=changeme \
               -e PLATFORM_ADMIN_FULL_NAME="Platform Administrator" \
-              ghcr.io/ibm/mcp-context-forge:0.9.0
+              ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
             ```
 
     3. **Generate a token inside the container**
@@ -216,7 +216,7 @@ Pick an install method below, generate an auth token, then walk through a real t
     2. **Pull the published image**
 
         ```bash
-        docker pull ghcr.io/ibm/mcp-context-forge:0.9.0
+        docker pull ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
         ```
 
     3. **Start the stack**
@@ -237,7 +237,7 @@ Pick an install method below, generate an auth token, then walk through a real t
     !!! tip "Database Support"
         The sample Compose file includes multiple database options:
 
-        - **PostgreSQL** (default): `postgresql://postgres:password@postgres:5432/mcp`
+        - **PostgreSQL** (default): `postgresql+psycopg://postgres:password@postgres:5432/mcp`
         - **MariaDB**: `mysql+pymysql://mysql:changeme@mariadb:3306/mcp` - fully supported with 36+ tables
         - **MySQL**: `mysql+pymysql://admin:changeme@mysql:3306/mcp`
 

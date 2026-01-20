@@ -35,20 +35,47 @@ error
 # Standard
 import base64
 import hashlib
-import json
 import os
+from typing import Tuple
 
 # Third-Party
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import orjson
 from pydantic import SecretStr
 
 # First-Party
 from mcpgateway.config import settings
 
+# Cache for derived key and AESGCM instance
+# Key: passphrase value, Value: (key_bytes, AESGCM instance)
+_crypto_cache: dict[str, Tuple[bytes, AESGCM]] = {}
+
+
+def _get_passphrase() -> str:
+    """Extract passphrase from settings, handling SecretStr type.
+
+    Returns:
+        str: The passphrase value
+
+    Raises:
+        ValueError: If the passphrase is not set or empty
+    """
+    passphrase = settings.auth_encryption_secret
+    if not passphrase:
+        raise ValueError("AUTH_ENCRYPTION_SECRET not set in environment.")
+
+    # If it's SecretStr, extract the real value
+    if isinstance(passphrase, SecretStr):
+        return passphrase.get_secret_value()
+    return passphrase
+
 
 def get_key() -> bytes:
     """
     Generate a 32-byte AES encryption key derived from a passphrase.
+
+    The key is cached based on the passphrase value. If the passphrase
+    changes, the cache is automatically invalidated.
 
     Returns:
         bytes: A 32-byte encryption key.
@@ -71,15 +98,57 @@ def get_key() -> bytes:
     ...     print('error')
     error
     """
-    passphrase = settings.auth_encryption_secret
-    if not passphrase:
-        raise ValueError("AUTH_ENCRYPTION_SECRET not set in environment.")
+    passphrase = _get_passphrase()
 
-    # If it's SecretStr, extract the real value
-    if isinstance(passphrase, SecretStr):
-        passphrase = passphrase.get_secret_value()
+    # Check cache
+    if passphrase in _crypto_cache:
+        return _crypto_cache[passphrase][0]
 
-    return hashlib.sha256(passphrase.encode()).digest()  # 32-byte key
+    # Derive key
+    key = hashlib.sha256(passphrase.encode()).digest()  # 32-byte key
+
+    # Cache key and AESGCM together
+    aesgcm = AESGCM(key)
+    _crypto_cache.clear()  # Clear old entries
+    _crypto_cache[passphrase] = (key, aesgcm)
+
+    return key
+
+
+def _get_aesgcm() -> AESGCM:
+    """Get cached AESGCM instance, creating if needed.
+
+    Returns:
+        AESGCM: Cached AESGCM cipher instance
+
+    Raises:
+        ValueError: If the passphrase is not set or empty
+    """
+    passphrase = _get_passphrase()
+
+    # Check cache
+    if passphrase in _crypto_cache:
+        return _crypto_cache[passphrase][1]
+
+    # Derive key and create AESGCM
+    key = hashlib.sha256(passphrase.encode()).digest()
+    aesgcm = AESGCM(key)
+
+    # Cache both
+    _crypto_cache.clear()  # Clear old entries
+    _crypto_cache[passphrase] = (key, aesgcm)
+
+    return aesgcm
+
+
+def clear_crypto_cache() -> None:
+    """Clear the crypto cache.
+
+    Call this function:
+    - In test fixtures to ensure test isolation
+    - After passphrase rotation (if supported at runtime)
+    """
+    _crypto_cache.clear()
 
 
 def encode_auth(auth_value: dict) -> str:
@@ -105,11 +174,10 @@ def encode_auth(auth_value: dict) -> str:
     """
     if not auth_value:
         return None
-    plaintext = json.dumps(auth_value)
-    key = get_key()
-    aesgcm = AESGCM(key)
+    plaintext = orjson.dumps(auth_value)
+    aesgcm = _get_aesgcm()
     nonce = os.urandom(12)
-    ciphertext = aesgcm.encrypt(nonce, plaintext.encode(), None)
+    ciphertext = aesgcm.encrypt(nonce, plaintext, None)
     combined = nonce + ciphertext
     encoded = base64.urlsafe_b64encode(combined).rstrip(b"=")
     return encoded.decode()
@@ -139,12 +207,11 @@ def decode_auth(encoded_value: str) -> dict:
     """
     if not encoded_value:
         return {}
-    key = get_key()
-    aesgcm = AESGCM(key)
+    aesgcm = _get_aesgcm()
     # Fix base64 padding
     padded = encoded_value + "=" * (-len(encoded_value) % 4)
     combined = base64.urlsafe_b64decode(padded)
     nonce = combined[:12]
     ciphertext = combined[12:]
     plaintext = aesgcm.decrypt(nonce, ciphertext, None)
-    return json.loads(plaintext.decode())
+    return orjson.loads(plaintext)

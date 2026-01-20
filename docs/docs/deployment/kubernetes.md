@@ -178,7 +178,7 @@ You can load your `.env` as a ConfigMap:
     cat > .env << EOF
     HOST=0.0.0.0
     PORT=4444
-    DATABASE_URL=postgresql://postgres:changeme@postgres-service:5432/mcp
+    DATABASE_URL=postgresql+psycopg://postgres:changeme@postgres-service:5432/mcp
     JWT_SECRET_KEY=your-secret-key
     BASIC_AUTH_USER=admin
     BASIC_AUTH_PASSWORD=changeme
@@ -314,6 +314,7 @@ data:
   JWT_AUDIENCE: "mcpgateway-production"
   JWT_ISSUER: "your-organization"
   JWT_AUDIENCE_VERIFICATION: "true"
+  JWT_ISSUER_VERIFICATION: "true"
   REQUIRE_TOKEN_EXPIRATION: "true"
 
   # Security settings
@@ -471,5 +472,8 @@ livenessProbe:
   initialDelaySeconds: 10
   periodSeconds: 15
 ```
+
+!!! tip "Startup Resilience"
+    If the database or Redis becomes temporarily unavailable, the Gateway uses **exponential backoff with jitter** for connection retries (2s → 4s → 8s → ... capped at 30s, ±25% jitter). This prevents CPU-intensive crash-respawn loops during dependency outages. Configure with `DB_MAX_RETRIES`, `REDIS_MAX_RETRIES` (default: 30 each). See [Startup Resilience](../architecture/performance-architecture.md#startup-resilience) for details.
 
 ---

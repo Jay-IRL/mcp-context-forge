@@ -150,6 +150,13 @@ class TestResourcePluginIntegration:
                     def initialized(self) -> bool:
                         return self._initialized
 
+                    def has_hooks_for(self, hook_type) -> bool:
+                        """Return True for resource hooks this mock handles."""
+                        # First-Party
+                        from mcpgateway.plugins.framework import ResourceHookType
+
+                        return hook_type in (ResourceHookType.RESOURCE_PRE_FETCH, ResourceHookType.RESOURCE_POST_FETCH)
+
                     async def invoke_hook(self, hook_type, payload, global_context, local_contexts=None, **kwargs):
                         # First-Party
                         from mcpgateway.plugins.framework import ResourceHookType
@@ -352,7 +359,7 @@ class TestResourcePluginIntegration:
         created = await service.register_resource(test_db, resource)
 
         # Deactivate the resource
-        await service.toggle_resource_status(test_db, created.id, activate=False)
+        await service.set_resource_state(test_db, created.id, activate=False)
 
 
         # Try to read inactive resource

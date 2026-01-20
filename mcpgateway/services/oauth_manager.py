@@ -17,18 +17,20 @@ import base64
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
-import json
 import logging
 import secrets
 from typing import Any, Dict, Optional
 
 # Third-Party
-import aiohttp
+import httpx
+import orjson
 from requests_oauthlib import OAuth2Session
 
 # First-Party
 from mcpgateway.config import get_settings
 from mcpgateway.services.encryption_service import get_encryption_service
+from mcpgateway.services.http_client_service import get_http_client
+from mcpgateway.utils.redis_client import get_redis_client as _get_shared_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +43,15 @@ _state_lock = asyncio.Lock()
 # State TTL in seconds (5 minutes)
 STATE_TTL_SECONDS = 300
 
-# Redis client for distributed state storage (initialized lazily)
+# Redis client for distributed state storage (uses shared factory)
 _redis_client: Optional[Any] = None
 _REDIS_INITIALIZED = False
 
 
 async def _get_redis_client():
-    """Get or create Redis client for distributed state storage.
+    """Get shared Redis client for distributed state storage.
+
+    Uses the centralized Redis client factory for consistent configuration.
 
     Returns:
         Redis client instance or None if unavailable
@@ -60,15 +64,11 @@ async def _get_redis_client():
     settings = get_settings()
     if settings.cache_type == "redis" and settings.redis_url:
         try:
-            # Third-Party
-            import aioredis  # pylint: disable=import-outside-toplevel
-
-            _redis_client = await aioredis.from_url(settings.redis_url, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
-            # Test connection
-            await _redis_client.ping()
-            logger.info("Connected to Redis for OAuth state storage")
+            _redis_client = await _get_shared_redis_client()
+            if _redis_client:
+                logger.info("OAuth manager connected to shared Redis client")
         except Exception as e:
-            logger.warning(f"Failed to connect to Redis, falling back to in-memory storage: {e}")
+            logger.warning(f"Failed to get Redis client, falling back to in-memory storage: {e}")
             _redis_client = None
     else:
         _redis_client = None
@@ -126,6 +126,14 @@ class OAuthManager:
         self.max_retries = max_retries
         self.token_storage = token_storage
         self.settings = get_settings()
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Get the shared singleton HTTP client.
+
+        Returns:
+            Shared httpx.AsyncClient instance with connection pooling
+        """
+        return await get_http_client()
 
     def _generate_pkce_params(self) -> Dict[str, str]:
         """Generate PKCE parameters for OAuth Authorization Code flow (RFC 7636).
@@ -245,37 +253,37 @@ class OAuthManager:
         # Fetch token with retries
         for attempt in range(self.max_retries):
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(token_url, data=token_data, timeout=aiohttp.ClientTimeout(total=self.request_timeout)) as response:
-                        response.raise_for_status()
+                client = await self._get_client()
+                response = await client.post(token_url, data=token_data, timeout=self.request_timeout)
+                response.raise_for_status()
 
-                        # GitHub returns form-encoded responses, not JSON
-                        content_type = response.headers.get("content-type", "")
-                        if "application/x-www-form-urlencoded" in content_type:
-                            # Parse form-encoded response
-                            text_response = await response.text()
-                            token_response = {}
-                            for pair in text_response.split("&"):
-                                if "=" in pair:
-                                    key, value = pair.split("=", 1)
-                                    token_response[key] = value
-                        else:
-                            # Try JSON response
-                            try:
-                                token_response = await response.json()
-                            except Exception as e:
-                                logger.warning(f"Failed to parse JSON response: {e}")
-                                # Fallback to text parsing
-                                text_response = await response.text()
-                                token_response = {"raw_response": text_response}
+                # GitHub returns form-encoded responses, not JSON
+                content_type = response.headers.get("content-type", "")
+                if "application/x-www-form-urlencoded" in content_type:
+                    # Parse form-encoded response
+                    text_response = response.text
+                    token_response = {}
+                    for pair in text_response.split("&"):
+                        if "=" in pair:
+                            key, value = pair.split("=", 1)
+                            token_response[key] = value
+                else:
+                    # Try JSON response
+                    try:
+                        token_response = response.json()
+                    except Exception as e:
+                        logger.warning(f"Failed to parse JSON response: {e}")
+                        # Fallback to text parsing
+                        text_response = response.text
+                        token_response = {"raw_response": text_response}
 
-                        if "access_token" not in token_response:
-                            raise OAuthError(f"No access_token in response: {token_response}")
+                if "access_token" not in token_response:
+                    raise OAuthError(f"No access_token in response: {token_response}")
 
-                        logger.info("""Successfully obtained access token via client credentials""")
-                        return token_response["access_token"]
+                logger.info("""Successfully obtained access token via client credentials""")
+                return token_response["access_token"]
 
-            except aiohttp.ClientError as e:
+            except httpx.HTTPError as e:
                 logger.warning(f"Token request attempt {attempt + 1} failed: {str(e)}")
                 if attempt == self.max_retries - 1:
                     raise OAuthError(f"Failed to obtain access token after {self.max_retries} attempts: {str(e)}")
@@ -344,37 +352,37 @@ class OAuthManager:
         # Fetch token with retries
         for attempt in range(self.max_retries):
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(token_url, data=token_data, timeout=aiohttp.ClientTimeout(total=self.request_timeout)) as response:
-                        response.raise_for_status()
+                client = await self._get_client()
+                response = await client.post(token_url, data=token_data, timeout=self.request_timeout)
+                response.raise_for_status()
 
-                        # Handle both JSON and form-encoded responses
-                        content_type = response.headers.get("content-type", "")
-                        if "application/x-www-form-urlencoded" in content_type:
-                            # Parse form-encoded response
-                            text_response = await response.text()
-                            token_response = {}
-                            for pair in text_response.split("&"):
-                                if "=" in pair:
-                                    key, value = pair.split("=", 1)
-                                    token_response[key] = value
-                        else:
-                            # Try JSON response
-                            try:
-                                token_response = await response.json()
-                            except Exception as e:
-                                logger.warning(f"Failed to parse JSON response: {e}")
-                                # Fallback to text parsing
-                                text_response = await response.text()
-                                token_response = {"raw_response": text_response}
+                # Handle both JSON and form-encoded responses
+                content_type = response.headers.get("content-type", "")
+                if "application/x-www-form-urlencoded" in content_type:
+                    # Parse form-encoded response
+                    text_response = response.text
+                    token_response = {}
+                    for pair in text_response.split("&"):
+                        if "=" in pair:
+                            key, value = pair.split("=", 1)
+                            token_response[key] = value
+                else:
+                    # Try JSON response
+                    try:
+                        token_response = response.json()
+                    except Exception as e:
+                        logger.warning(f"Failed to parse JSON response: {e}")
+                        # Fallback to text parsing
+                        text_response = response.text
+                        token_response = {"raw_response": text_response}
 
-                        if "access_token" not in token_response:
-                            raise OAuthError(f"No access_token in response: {token_response}")
+                if "access_token" not in token_response:
+                    raise OAuthError(f"No access_token in response: {token_response}")
 
-                        logger.info("Successfully obtained access token via password grant")
-                        return token_response["access_token"]
+                logger.info("Successfully obtained access token via password grant")
+                return token_response["access_token"]
 
-            except aiohttp.ClientError as e:
+            except httpx.HTTPError as e:
                 logger.warning(f"Token request attempt {attempt + 1} failed: {str(e)}")
                 if attempt == self.max_retries - 1:
                     raise OAuthError(f"Failed to obtain access token after {self.max_retries} attempts: {str(e)}")
@@ -455,37 +463,37 @@ class OAuthManager:
         # Exchange code for token with retries
         for attempt in range(self.max_retries):
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(token_url, data=token_data, timeout=aiohttp.ClientTimeout(total=self.request_timeout)) as response:
-                        response.raise_for_status()
+                client = await self._get_client()
+                response = await client.post(token_url, data=token_data, timeout=self.request_timeout)
+                response.raise_for_status()
 
-                        # GitHub returns form-encoded responses, not JSON
-                        content_type = response.headers.get("content-type", "")
-                        if "application/x-www-form-urlencoded" in content_type:
-                            # Parse form-encoded response
-                            text_response = await response.text()
-                            token_response = {}
-                            for pair in text_response.split("&"):
-                                if "=" in pair:
-                                    key, value = pair.split("=", 1)
-                                    token_response[key] = value
-                        else:
-                            # Try JSON response
-                            try:
-                                token_response = await response.json()
-                            except Exception as e:
-                                logger.warning(f"Failed to parse JSON response: {e}")
-                                # Fallback to text parsing
-                                text_response = await response.text()
-                                token_response = {"raw_response": text_response}
+                # GitHub returns form-encoded responses, not JSON
+                content_type = response.headers.get("content-type", "")
+                if "application/x-www-form-urlencoded" in content_type:
+                    # Parse form-encoded response
+                    text_response = response.text
+                    token_response = {}
+                    for pair in text_response.split("&"):
+                        if "=" in pair:
+                            key, value = pair.split("=", 1)
+                            token_response[key] = value
+                else:
+                    # Try JSON response
+                    try:
+                        token_response = response.json()
+                    except Exception as e:
+                        logger.warning(f"Failed to parse JSON response: {e}")
+                        # Fallback to text parsing
+                        text_response = response.text
+                        token_response = {"raw_response": text_response}
 
-                        if "access_token" not in token_response:
-                            raise OAuthError(f"No access_token in response: {token_response}")
+                if "access_token" not in token_response:
+                    raise OAuthError(f"No access_token in response: {token_response}")
 
-                        logger.info("""Successfully exchanged authorization code for access token""")
-                        return token_response["access_token"]
+                logger.info("""Successfully exchanged authorization code for access token""")
+                return token_response["access_token"]
 
-            except aiohttp.ClientError as e:
+            except httpx.HTTPError as e:
                 logger.warning(f"Token exchange attempt {attempt + 1} failed: {str(e)}")
                 if attempt == self.max_retries - 1:
                     raise OAuthError(f"Failed to exchange code for token after {self.max_retries} attempts: {str(e)}")
@@ -563,7 +571,7 @@ class OAuthManager:
 
             # Parse state data
             state_json = state_bytes.decode()
-            state_payload = json.loads(state_json)
+            state_payload = orjson.loads(state_json)
             app_user_email = state_payload.get("app_user_email")
             state_gateway_id = state_payload.get("gateway_id")
 
@@ -626,9 +634,8 @@ class OAuthManager:
         # Include user email in state for secure user association
         state_data = {"gateway_id": gateway_id, "app_user_email": app_user_email, "nonce": secrets.token_urlsafe(16), "timestamp": datetime.now(timezone.utc).isoformat()}
 
-        # Encode state as JSON
-        state_json = json.dumps(state_data, separators=(",", ":"))
-        state_bytes = state_json.encode()
+        # Encode state as JSON (orjson produces compact output by default)
+        state_bytes = orjson.dumps(state_data)
 
         # Create HMAC signature
         secret_key = self.settings.auth_encryption_secret.get_secret_value().encode() if self.settings.auth_encryption_secret else b"default-secret-key"
@@ -659,7 +666,7 @@ class OAuthManager:
                     state_key = f"oauth:state:{gateway_id}:{state}"
                     state_data = {"state": state, "gateway_id": gateway_id, "code_verifier": code_verifier, "expires_at": expires_at.isoformat(), "used": False}
                     # Store in Redis with TTL
-                    await redis.setex(state_key, STATE_TTL_SECONDS, json.dumps(state_data))
+                    await redis.setex(state_key, STATE_TTL_SECONDS, orjson.dumps(state_data))
                     logger.debug(f"Stored OAuth state in Redis for gateway {gateway_id}")
                     return
                 except Exception as e:
@@ -727,7 +734,7 @@ class OAuthManager:
                         logger.warning(f"State not found in Redis for gateway {gateway_id}")
                         return False
 
-                    state_data = json.loads(state_json)
+                    state_data = orjson.loads(state_json)
 
                     # Parse expires_at as timezone-aware datetime. If the stored value
                     # is naive, assume UTC for compatibility.
@@ -851,7 +858,7 @@ class OAuthManager:
                     if not state_json:
                         return None
 
-                    state_data = json.loads(state_json)
+                    state_data = orjson.loads(state_json)
 
                     # Check expiration
                     try:
@@ -980,8 +987,18 @@ class OAuthManager:
         if scopes:
             params["scope"] = " ".join(scopes) if isinstance(scopes, list) else scopes
 
-        # Build full URL
-        query_string = urlencode(params)
+        # Add resource parameter for JWT access token (RFC 8707)
+        # The resource is the MCP server URL, set by oauth_router.py
+        resource = credentials.get("resource")
+        if resource:
+            # RFC 8707 allows multiple resource parameters
+            if isinstance(resource, list):
+                params["resource"] = resource  # urlencode with doseq=True handles lists
+            else:
+                params["resource"] = resource
+
+        # Build full URL (doseq=True handles list values like multiple resource params)
+        query_string = urlencode(params, doseq=True)
         return f"{authorization_url}?{query_string}"
 
     async def _exchange_code_for_tokens(self, credentials: Dict[str, Any], code: str, code_verifier: str = None) -> Dict[str, Any]:
@@ -1033,40 +1050,54 @@ class OAuthManager:
         if code_verifier:
             token_data["code_verifier"] = code_verifier
 
+        # Add resource parameter to request JWT access token (RFC 8707)
+        # The resource identifies the MCP server (resource server), not the OAuth server
+        resource = credentials.get("resource")
+        if resource:
+            if isinstance(resource, list):
+                # RFC 8707 allows multiple resource parameters - use list of tuples
+                form_data: list[tuple[str, str]] = list(token_data.items())
+                for r in resource:
+                    if r:
+                        form_data.append(("resource", r))
+                token_data = form_data  # type: ignore[assignment]
+            else:
+                token_data["resource"] = resource
+
         # Exchange code for token with retries
         for attempt in range(self.max_retries):
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(token_url, data=token_data, timeout=aiohttp.ClientTimeout(total=self.request_timeout)) as response:
-                        response.raise_for_status()
+                client = await self._get_client()
+                response = await client.post(token_url, data=token_data, timeout=self.request_timeout)
+                response.raise_for_status()
 
-                        # GitHub returns form-encoded responses, not JSON
-                        content_type = response.headers.get("content-type", "")
-                        if "application/x-www-form-urlencoded" in content_type:
-                            # Parse form-encoded response
-                            text_response = await response.text()
-                            token_response = {}
-                            for pair in text_response.split("&"):
-                                if "=" in pair:
-                                    key, value = pair.split("=", 1)
-                                    token_response[key] = value
-                        else:
-                            # Try JSON response
-                            try:
-                                token_response = await response.json()
-                            except Exception as e:
-                                logger.warning(f"Failed to parse JSON response: {e}")
-                                # Fallback to text parsing
-                                text_response = await response.text()
-                                token_response = {"raw_response": text_response}
+                # GitHub returns form-encoded responses, not JSON
+                content_type = response.headers.get("content-type", "")
+                if "application/x-www-form-urlencoded" in content_type:
+                    # Parse form-encoded response
+                    text_response = response.text
+                    token_response = {}
+                    for pair in text_response.split("&"):
+                        if "=" in pair:
+                            key, value = pair.split("=", 1)
+                            token_response[key] = value
+                else:
+                    # Try JSON response
+                    try:
+                        token_response = response.json()
+                    except Exception as e:
+                        logger.warning(f"Failed to parse JSON response: {e}")
+                        # Fallback to text parsing
+                        text_response = response.text
+                        token_response = {"raw_response": text_response}
 
-                        if "access_token" not in token_response:
-                            raise OAuthError(f"No access_token in response: {token_response}")
+                if "access_token" not in token_response:
+                    raise OAuthError(f"No access_token in response: {token_response}")
 
-                        logger.info("""Successfully exchanged authorization code for tokens""")
-                        return token_response
+                logger.info("""Successfully exchanged authorization code for tokens""")
+                return token_response
 
-            except aiohttp.ClientError as e:
+            except httpx.HTTPError as e:
                 logger.warning(f"Token exchange attempt {attempt + 1} failed: {str(e)}")
                 if attempt == self.max_retries - 1:
                     raise OAuthError(f"Failed to exchange code for token after {self.max_retries} attempts: {str(e)}")
@@ -1112,28 +1143,42 @@ class OAuthManager:
         if client_secret:
             token_data["client_secret"] = client_secret
 
+        # Add resource parameter for JWT access token (RFC 8707)
+        # Must be included in refresh requests to maintain JWT token type
+        resource = credentials.get("resource")
+        if resource:
+            if isinstance(resource, list):
+                # RFC 8707 allows multiple resource parameters - use list of tuples
+                form_data: list[tuple[str, str]] = list(token_data.items())
+                for r in resource:
+                    if r:
+                        form_data.append(("resource", r))
+                token_data = form_data  # type: ignore[assignment]
+            else:
+                token_data["resource"] = resource
+
         # Attempt token refresh with retries
         for attempt in range(self.max_retries):
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(token_url, data=token_data, timeout=aiohttp.ClientTimeout(total=self.request_timeout)) as response:
-                        if response.status == 200:
-                            token_response = await response.json()
+                client = await self._get_client()
+                response = await client.post(token_url, data=token_data, timeout=self.request_timeout)
+                if response.status_code == 200:
+                    token_response = response.json()
 
-                            # Validate required fields
-                            if "access_token" not in token_response:
-                                raise OAuthError("No access_token in refresh response")
+                    # Validate required fields
+                    if "access_token" not in token_response:
+                        raise OAuthError("No access_token in refresh response")
 
-                            logger.info("Successfully refreshed OAuth token")
-                            return token_response
+                    logger.info("Successfully refreshed OAuth token")
+                    return token_response
 
-                        error_text = await response.text()
-                        # If we get a 400/401, the refresh token is likely invalid
-                        if response.status in [400, 401]:
-                            raise OAuthError(f"Refresh token invalid or expired: {error_text}")
-                        logger.warning(f"Token refresh failed with status {response.status}: {error_text}")
+                error_text = response.text
+                # If we get a 400/401, the refresh token is likely invalid
+                if response.status_code in [400, 401]:
+                    raise OAuthError(f"Refresh token invalid or expired: {error_text}")
+                logger.warning(f"Token refresh failed with status {response.status_code}: {error_text}")
 
-            except aiohttp.ClientError as e:
+            except httpx.HTTPError as e:
                 logger.warning(f"Token refresh attempt {attempt + 1} failed: {str(e)}")
                 if attempt == self.max_retries - 1:
                     raise OAuthError(f"Failed to refresh token after {self.max_retries} attempts: {str(e)}")

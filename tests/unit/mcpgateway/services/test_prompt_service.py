@@ -44,6 +44,16 @@ from mcpgateway.services.prompt_service import (
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def mock_logging_services():
+    """Mock audit_trail and structured_logger to prevent database writes during tests."""
+    with patch("mcpgateway.services.prompt_service.audit_trail") as mock_audit, \
+         patch("mcpgateway.services.prompt_service.structured_logger") as mock_logger:
+        mock_audit.log_action = MagicMock(return_value=None)
+        mock_logger.log = MagicMock(return_value=None)
+        yield {"audit_trail": mock_audit, "structured_logger": mock_logger}
+
+
 @pytest.fixture
 def mock_prompt():
     """Create a mock prompt model."""
@@ -55,6 +65,9 @@ def mock_prompt():
     prompt.template = "Hello!"
     prompt.argument_schema = {}
     prompt.version = 1
+    prompt.visibility = "public"
+    prompt.team_id = None
+    prompt.owner_email = None
 
     return prompt
 
@@ -89,6 +102,10 @@ def _build_db_prompt(
     p = MagicMock(spec=DbPrompt)
     p.id = pid
     p.name = name
+    p.original_name = name
+    p.custom_name = name
+    p.custom_name_slug = name
+    p.display_name = name
     p.description = desc
     p.template = template
     p.argument_schema = {"properties": {"name": {"type": "string"}}, "required": ["name"]}
@@ -96,6 +113,11 @@ def _build_db_prompt(
     p.is_active = is_active
     # New model uses `enabled` — keep both attributes for backward compatibility in tests
     p.enabled = is_active
+    p.visibility = "public"
+    p.team_id = None
+    p.owner_email = "owner@example.com"
+    p.gateway_id = None
+    p.gateway = None
     p.metrics = metrics or []
     # validate_arguments: accept anything
     p.validate_arguments = Mock()
@@ -113,6 +135,23 @@ def _patch_promptread(monkeypatch):
     Bypass Pydantic validation: make PromptRead.model_validate a pass-through.
     """
     monkeypatch.setattr(PromptRead, "model_validate", staticmethod(lambda d: d))
+
+
+@pytest.fixture(autouse=True)
+def reset_jinja_singleton():
+    """Reset the module-level Jinja environment singleton before each test.
+
+    This is needed because PromptService now uses a shared singleton for
+    the Jinja environment (for caching), so tests that modify the environment
+    can affect subsequent tests.
+    """
+    import mcpgateway.services.prompt_service as ps
+
+    ps._JINJA_ENV = None
+    ps._compile_jinja_template.cache_clear()
+    yield
+    ps._JINJA_ENV = None
+    ps._compile_jinja_template.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +223,17 @@ class TestPromptService:
                 assert "409" in msg or "already exists" in msg or "Failed to register prompt" in msg
 
     @pytest.mark.asyncio
+    async def test_register_prompt_slug_conflict(self, prompt_service, test_db):
+        """Slug collisions should be detected as name conflicts."""
+        existing = _build_db_prompt(name="hello-world")
+        test_db.execute = Mock(return_value=_make_execute_result(scalar=existing))
+
+        pc = PromptCreate(name="Hello World", description="", template="X", arguments=[])
+
+        with pytest.raises(PromptError):
+            await prompt_service.register_prompt(test_db, pc)
+
+    @pytest.mark.asyncio
     async def test_register_prompt_template_validation_error(self, prompt_service, test_db):
         test_db.execute = Mock(return_value=_make_execute_result(scalar=None))
         test_db.add, test_db.commit, test_db.refresh = Mock(), Mock(), Mock()
@@ -235,6 +285,20 @@ class TestPromptService:
         assert msg.content.text == "Hello, Alice!"
 
     @pytest.mark.asyncio
+    async def test_get_prompt_by_name(self, prompt_service, test_db):
+        """Prompt lookup falls back to name when ID lookup misses."""
+        db_prompt = _build_db_prompt(template="Hello!")
+        test_db.execute = Mock(
+            side_effect=[
+                _make_execute_result(scalar=None),  # active by id
+                _make_execute_result(scalar=db_prompt),  # active by name
+            ]
+        )
+
+        result = await prompt_service.get_prompt(test_db, "gateway__greeting", {})
+        assert result.messages[0].content.text == "Hello!"
+
+    @pytest.mark.asyncio
     async def test_get_prompt_not_found(self, prompt_service, test_db):
         test_db.execute = Mock(return_value=_make_execute_result(scalar=None))
 
@@ -246,8 +310,9 @@ class TestPromptService:
         inactive = _build_db_prompt(is_active=False)
         test_db.execute = Mock(
             side_effect=[
-                _make_execute_result(scalar=None),  # active
-                _make_execute_result(scalar=inactive),  # inactive
+                _make_execute_result(scalar=None),  # active by id
+                _make_execute_result(scalar=None),  # active by name
+                _make_execute_result(scalar=inactive),  # inactive by id
             ]
         )
         with pytest.raises(PromptNotFoundError) as exc_info:
@@ -285,6 +350,8 @@ class TestPromptService:
     @pytest.mark.asyncio
     async def test_update_prompt_success(self, prompt_service, test_db):
         existing = _build_db_prompt()
+        existing.team_id = "team-123"
+        test_db.get = Mock(return_value=existing)
         test_db.execute = Mock(
             side_effect=[  # first call = find existing, second = conflict check
                 _make_execute_result(scalar=existing),
@@ -298,7 +365,8 @@ class TestPromptService:
         upd = PromptUpdate(description="new desc", template="Hi, {{ name }}!")
         res = await prompt_service.update_prompt(test_db, 1, upd)
 
-        test_db.commit.assert_called_once()
+        # commit called twice: once for update, once in _get_team_name to release transaction
+        assert test_db.commit.call_count == 2
         prompt_service._notify_prompt_updated.assert_called_once()
         assert res["description"] == "new desc"
         assert res["template"] == "Hi, {{ name }}!"
@@ -306,21 +374,20 @@ class TestPromptService:
     @pytest.mark.asyncio
     async def test_update_prompt_name_conflict(self, prompt_service, test_db):
         existing = _build_db_prompt()
+        test_db.get = Mock(return_value=existing)
         test_db.execute = Mock(
             side_effect=[
                 _make_execute_result(scalar=existing),
                 _make_execute_result(scalar=None),
             ]
         )
-        test_db.commit = Mock(side_effect=IntegrityError("UNIQUE constraint failed: prompt.name", None, BaseException(None)))
         upd = PromptUpdate(name="other")
-        with pytest.raises(IntegrityError) as exc_info:
+        with pytest.raises(PromptError):
             await prompt_service.update_prompt(test_db, 1, upd)
-        msg = str(exc_info.value).lower()
-        assert "unique constraint" in msg or "already exists" in msg or "failed to update prompt" in msg
 
     @pytest.mark.asyncio
     async def test_update_prompt_not_found(self, prompt_service, test_db):
+        test_db.get = Mock(return_value=None)
         test_db.execute = Mock(
             side_effect=[
                 _make_execute_result(scalar=None),  # active
@@ -335,20 +402,18 @@ class TestPromptService:
     @pytest.mark.asyncio
     async def test_update_prompt_inactive(self, prompt_service, test_db):
         inactive = _build_db_prompt(is_active=False)
-        test_db.execute = Mock(
-            side_effect=[
-                _make_execute_result(scalar=None),  # active
-                _make_execute_result(scalar=inactive),  # inactive
-            ]
-        )
+        test_db.get = Mock(return_value=inactive)
+        test_db.commit = Mock()
+        test_db.refresh = Mock()
+        prompt_service._notify_prompt_updated = AsyncMock()
         upd = PromptUpdate(description="desc")
-        with pytest.raises(PromptError) as exc_info:
-            await prompt_service.update_prompt(test_db, 1, upd)
-        assert "inactive" in str(exc_info.value) or "Failed to update prompt" in str(exc_info.value)
+        res = await prompt_service.update_prompt(test_db, 1, upd)
+        assert res["description"] == "desc"
 
     @pytest.mark.asyncio
     async def test_update_prompt_exception(self, prompt_service, test_db):
         existing = _build_db_prompt()
+        test_db.get = Mock(return_value=existing)
         test_db.execute = Mock(side_effect=[_make_execute_result(scalar=existing), _make_execute_result(scalar=None)])
         test_db.commit = Mock(side_effect=Exception("fail"))
         upd = PromptUpdate(description="desc")
@@ -357,11 +422,11 @@ class TestPromptService:
         assert "Failed to update prompt" in str(exc_info.value)
 
     # ──────────────────────────────────────────────────────────────────
-    #   toggle status
+    #   set state
     # ──────────────────────────────────────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_toggle_prompt_status(self, prompt_service, test_db):
+    async def test_set_prompt_state(self, prompt_service, test_db):
         # Ensure the mock prompt has a real id and primitive attributes
         p = MagicMock(spec=DbPrompt)
         p.id = 1
@@ -374,27 +439,27 @@ class TestPromptService:
         test_db.refresh = Mock()
         prompt_service._notify_prompt_deactivated = AsyncMock()
 
-        res = await prompt_service.toggle_prompt_status(test_db, 1, activate=False)
+        res = await prompt_service.set_prompt_state(test_db, 1, activate=False)
 
         assert p.enabled is False
         prompt_service._notify_prompt_deactivated.assert_called_once()
         assert res["enabled"] is False
 
     @pytest.mark.asyncio
-    async def test_toggle_prompt_status_not_found(self, prompt_service, test_db):
+    async def test_set_prompt_state_not_found(self, prompt_service, test_db):
         test_db.get = Mock(return_value=None)
         with pytest.raises(PromptError) as exc_info:
-            await prompt_service.toggle_prompt_status(test_db, 999, activate=True)
+            await prompt_service.set_prompt_state(test_db, 999, activate=True)
         assert "Prompt not found" in str(exc_info.value)
 
     @pytest.mark.asyncio
-    async def test_toggle_prompt_status_exception(self, prompt_service, test_db):
+    async def test_set_prompt_state_exception(self, prompt_service, test_db):
         p = _build_db_prompt(is_active=True)
         test_db.get = Mock(return_value=p)
         test_db.commit = Mock(side_effect=Exception("fail"))
         with pytest.raises(PromptError) as exc_info:
-            await prompt_service.toggle_prompt_status(test_db, 1, activate=False)
-        assert "Failed to toggle prompt status" in str(exc_info.value)
+            await prompt_service.set_prompt_state(test_db, 1, activate=False)
+        assert "Failed to set prompt state" in str(exc_info.value)
 
     # ──────────────────────────────────────────────────────────────────
     #   delete_prompt
@@ -413,6 +478,21 @@ class TestPromptService:
 
         test_db.delete.assert_called_once_with(p)
         prompt_service._notify_prompt_deleted.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_delete_prompt_purge_metrics(self, prompt_service, test_db):
+        p = _build_db_prompt()
+        test_db.get = Mock(return_value=p)
+        test_db.delete = Mock()
+        test_db.commit = Mock()
+        test_db.execute = Mock()
+        prompt_service._notify_prompt_deleted = AsyncMock()
+
+        await prompt_service.delete_prompt(test_db, 1, purge_metrics=True)
+
+        assert test_db.execute.call_count == 2
+        test_db.delete.assert_called_once_with(p)
+        test_db.commit.assert_called_once()
 
 
     @pytest.mark.asyncio
@@ -482,15 +562,20 @@ class TestPromptService:
         assert "code" in required
 
     def test_render_template_fallback_and_error(self, prompt_service):
-        # Patch jinja_env.from_string to raise
-        prompt_service._jinja_env.from_string = Mock(side_effect=Exception("bad"))
-        # Fallback to format
-        template = "Hello, {name}!"
-        result = prompt_service._render_template(template, {"name": "Alice"})
-        assert result == "Hello, Alice!"
-        # Format also fails
-        with pytest.raises(PromptError):
-            prompt_service._render_template(template, {})
+        # Patch _compile_jinja_template to return a template that fails on render
+        with patch("mcpgateway.services.prompt_service._compile_jinja_template") as mock_compile:
+            mock_template = MagicMock()
+            mock_template.render.side_effect = Exception("bad")
+            mock_compile.return_value = mock_template
+
+            # Fallback to format
+            template = "Hello, {name}!"
+            result = prompt_service._render_template(template, {"name": "Alice"})
+            assert result == "Hello, Alice!"
+
+            # Format also fails
+            with pytest.raises(PromptError):
+                prompt_service._render_template(template, {})
 
     def test_parse_messages_roles(self, prompt_service):
         text = "# User:\nHello\n# Assistant:\nHi!"
@@ -504,30 +589,34 @@ class TestPromptService:
 
     @pytest.mark.asyncio
     async def test_aggregate_and_reset_metrics(self, prompt_service, test_db):
-        # Metrics numbers to be returned by scalar() calls
-        test_db.execute = Mock(
-            side_effect=[
-                _make_execute_result(scalar=10),  # total
-                _make_execute_result(scalar=8),  # successful
-                _make_execute_result(scalar=2),  # failed
-                _make_execute_result(scalar=0.1),  # min_rt
-                _make_execute_result(scalar=0.9),  # max_rt
-                _make_execute_result(scalar=0.5),  # avg_rt
-                _make_execute_result(scalar=datetime(2025, 1, 1, tzinfo=timezone.utc)),  # last_time
-            ]
+        # Mock aggregate_metrics_combined to return a proper AggregatedMetrics result
+        from mcpgateway.services.metrics_query_service import AggregatedMetrics
+
+        mock_result = AggregatedMetrics(
+            total_executions=10,
+            successful_executions=8,
+            failed_executions=2,
+            failure_rate=0.2,
+            min_response_time=0.1,
+            max_response_time=0.9,
+            avg_response_time=0.5,
+            last_execution_time="2025-01-01T00:00:00+00:00",
+            raw_count=6,
+            rollup_count=4,
         )
 
-        metrics = await prompt_service.aggregate_metrics(test_db)
-        assert metrics["total_executions"] == 10
-        assert metrics["successful_executions"] == 8
-        assert metrics["failed_executions"] == 2
-        assert metrics["failure_rate"] == 0.2
+        with patch("mcpgateway.services.metrics_query_service.aggregate_metrics_combined", return_value=mock_result):
+            metrics = await prompt_service.aggregate_metrics(test_db)
+            assert metrics["total_executions"] == 10
+            assert metrics["successful_executions"] == 8
+            assert metrics["failed_executions"] == 2
+            assert metrics["failure_rate"] == 0.2
 
         # reset_metrics
         test_db.execute = Mock()
         test_db.commit = Mock()
         await prompt_service.reset_metrics(test_db)
-        test_db.execute.assert_called()
+        assert test_db.execute.call_count == 2
         test_db.commit.assert_called_once()
 
     @pytest.mark.asyncio
@@ -537,6 +626,7 @@ class TestPromptService:
 
         # Mock query chain - support pagination methods
         mock_query = MagicMock()
+        mock_query.options.return_value = mock_query  # For joinedload
         mock_query.where.return_value = mock_query
         mock_query.order_by.return_value = mock_query
         mock_query.limit.return_value = mock_query
@@ -563,8 +653,143 @@ class TestPromptService:
                 assert called_args[0] is session  # session passed through
                 # third positional arg is the tags list (signature: session, col, values, match_any=True)
                 assert called_args[2] == ["test", "production"]
-                # and the fake condition returned must have been passed to where()
-                mock_query.where.assert_called_with(fake_condition)
+                # and the fake condition returned must have been passed to where() at some point
+                # (there may be multiple where() calls for enabled filter and tags filter)
+                mock_query.where.assert_any_call(fake_condition)
                 # finally, your service should return the list produced by mock_db.execute(...)
                 assert isinstance(result, list)
                 assert len(result) == 1
+
+
+# --------------------------------------------------------------------------- #
+#                         Cache Behavior Tests                                #
+# --------------------------------------------------------------------------- #
+
+
+class TestJinjaTemplateCaching:
+    """Tests for Jinja template caching (#1814)."""
+
+    def test_template_caching_works(self):
+        """Verify template compilation is cached across renders."""
+        from mcpgateway.services.prompt_service import PromptService, _compile_jinja_template
+
+        service = PromptService()
+        template = "Hello {{ name }}"
+
+        result1 = service._render_template(template, {"name": "World"})
+        assert result1 == "Hello World"
+
+        result2 = service._render_template(template, {"name": "Claude"})
+        assert result2 == "Hello Claude"
+
+        info = _compile_jinja_template.cache_info()
+        assert info.hits == 1
+        assert info.misses == 1
+
+    def test_different_templates_cached_separately(self):
+        """Verify different templates get separate cache entries."""
+        from mcpgateway.services.prompt_service import PromptService, _compile_jinja_template
+
+        service = PromptService()
+
+        result1 = service._render_template("Hello {{ name }}", {"name": "A"})
+        result2 = service._render_template("Goodbye {{ name }}", {"name": "B"})
+
+        assert result1 == "Hello A"
+        assert result2 == "Goodbye B"
+
+        info = _compile_jinja_template.cache_info()
+        assert info.misses == 2  # Two different templates
+
+    def test_format_fallback_still_works(self):
+        """Verify Python format() fallback works when Jinja render fails."""
+        from mcpgateway.services.prompt_service import PromptService, _compile_jinja_template
+
+        service = PromptService()
+
+        # Mock _compile_jinja_template to return a template that fails on render
+        with patch("mcpgateway.services.prompt_service._compile_jinja_template") as mock_compile:
+            mock_template = MagicMock()
+            mock_template.render.side_effect = Exception("Jinja render error")
+            mock_compile.return_value = mock_template
+
+            # Should fall back to Python format()
+            template = "Hello, {name}!"
+            result = service._render_template(template, {"name": "Alice"})
+            assert result == "Hello, Alice!"
+
+
+class TestPromptAccessAuthorization:
+    """Tests for _check_prompt_access authorization logic."""
+
+    @pytest.fixture
+    def prompt_service(self):
+        """Create a prompt service instance."""
+        return PromptService()
+
+    @pytest.fixture
+    def mock_db(self):
+        """Create a mock database session."""
+        db = MagicMock()
+        db.commit = Mock()
+        return db
+
+    def _create_mock_prompt(self, visibility="public", owner_email=None, team_id=None):
+        """Helper to create mock prompt."""
+        prompt = MagicMock()
+        prompt.visibility = visibility
+        prompt.owner_email = owner_email
+        prompt.team_id = team_id
+        return prompt
+
+    @pytest.mark.asyncio
+    async def test_check_prompt_access_public_always_allowed(self, prompt_service, mock_db):
+        """Public prompts should be accessible to anyone."""
+        public_prompt = self._create_mock_prompt(visibility="public")
+
+        # Unauthenticated
+        assert await prompt_service._check_prompt_access(mock_db, public_prompt, user_email=None, token_teams=[]) is True
+        # Authenticated
+        assert await prompt_service._check_prompt_access(mock_db, public_prompt, user_email="user@test.com", token_teams=["team-1"]) is True
+        # Admin
+        assert await prompt_service._check_prompt_access(mock_db, public_prompt, user_email=None, token_teams=None) is True
+
+    @pytest.mark.asyncio
+    async def test_check_prompt_access_admin_bypass(self, prompt_service, mock_db):
+        """Admin (user_email=None, token_teams=None) should have full access."""
+        private_prompt = self._create_mock_prompt(visibility="private", owner_email="secret@test.com", team_id="secret-team")
+
+        # Admin bypass: both None = unrestricted access
+        assert await prompt_service._check_prompt_access(mock_db, private_prompt, user_email=None, token_teams=None) is True
+
+    @pytest.mark.asyncio
+    async def test_check_prompt_access_private_denied_to_unauthenticated(self, prompt_service, mock_db):
+        """Private prompts should be denied to unauthenticated users."""
+        private_prompt = self._create_mock_prompt(visibility="private", owner_email="owner@test.com")
+
+        # Unauthenticated (public-only token)
+        assert await prompt_service._check_prompt_access(mock_db, private_prompt, user_email=None, token_teams=[]) is False
+
+    @pytest.mark.asyncio
+    async def test_check_prompt_access_private_allowed_to_owner(self, prompt_service, mock_db):
+        """Private prompts should be accessible to the owner."""
+        private_prompt = self._create_mock_prompt(visibility="private", owner_email="owner@test.com")
+
+        # Owner with non-empty token_teams
+        assert await prompt_service._check_prompt_access(mock_db, private_prompt, user_email="owner@test.com", token_teams=["some-team"]) is True
+
+    @pytest.mark.asyncio
+    async def test_check_prompt_access_team_prompt_allowed_to_member(self, prompt_service, mock_db):
+        """Team prompts should be accessible to team members."""
+        team_prompt = self._create_mock_prompt(visibility="team", owner_email="owner@test.com", team_id="team-abc")
+
+        # Team member via token_teams
+        assert await prompt_service._check_prompt_access(mock_db, team_prompt, user_email="member@test.com", token_teams=["team-abc"]) is True
+
+    @pytest.mark.asyncio
+    async def test_check_prompt_access_team_prompt_denied_to_non_member(self, prompt_service, mock_db):
+        """Team prompts should be denied to non-members."""
+        team_prompt = self._create_mock_prompt(visibility="team", owner_email="owner@test.com", team_id="team-abc")
+
+        # Non-member
+        assert await prompt_service._check_prompt_access(mock_db, team_prompt, user_email="outsider@test.com", token_teams=["other-team"]) is False

@@ -30,6 +30,36 @@
       },
       "additionalProperties": false
     },
+    "serviceAccount": {
+      "type": "object",
+      "description": "ServiceAccount configuration for all pods in the release",
+      "properties": {
+        "create": {
+          "type": "boolean",
+          "description": "Create a ServiceAccount",
+          "default": false
+        },
+        "name": {
+          "type": "string",
+          "description": "ServiceAccount name (uses fullname if empty)",
+          "default": ""
+        },
+        "annotations": {
+          "type": "object",
+          "description": "Annotations for the ServiceAccount (e.g., IRSA, Workload Identity)",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "automountServiceAccountToken": {
+          "type": "boolean",
+          "description": "Mount the ServiceAccount token in pods",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
     "mcpContextForge": {
       "type": "object",
       "description": "MCP Context-Forge Gateway configuration",
@@ -40,6 +70,72 @@
           "minimum": 1,
           "maximum": 100,
           "default": 2
+        },
+        "extraEnvFrom": {
+            "type": "array",
+            "description": "Additional environment variables from secrets or configmaps",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "secretRef": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" }
+                        },
+                        "required": ["name"]
+                    },
+                    "configMapRef": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" }
+                        },
+                        "required": ["name"]
+                    },
+                    "prefix": { "type": "string" }
+                }
+            },
+            "default": []
+        },
+        "extraEnv": {
+            "type": "array",
+            "description": "Additional environment variables",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "value": { "type": "string" },
+                    "valueFrom": {
+                        "type": "object",
+                        "properties": {
+                            "secretKeyRef": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "key": { "type": "string" }
+                                },
+                                "required": ["name", "key"]
+                            },
+                            "configMapKeyRef": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "key": { "type": "string" }
+                                },
+                                "required": ["name", "key"]
+                            },
+                            "fieldRef": {
+                                "type": "object",
+                                "properties": {
+                                    "fieldPath": { "type": "string" }
+                                },
+                                "required": ["fieldPath"]
+                            }
+                        }
+                    }
+                },
+                "required": ["name"]
+            },
+            "default": []
         },
         "hpa": {
           "type": "object",
@@ -121,6 +217,14 @@
               "minimum": 1,
               "maximum": 65535,
               "default": 80
+            },
+            "annotations": {
+              "type": "object",
+              "description": "Service annotations (e.g., for AWS NLB, GCP load balancer configuration)",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {}
             }
           },
           "additionalProperties": false
@@ -323,8 +427,8 @@
           "properties": {
             "GUNICORN_WORKERS": {
               "type": "string",
-              "description": "Number of Gunicorn worker processes",
-              "default": "2"
+              "description": "Number of Gunicorn worker processes (auto = 2*CPU+1, capped at 16)",
+              "default": "auto"
             },
             "GUNICORN_TIMEOUT": {
               "type": "string",
@@ -334,7 +438,7 @@
             "GUNICORN_MAX_REQUESTS": {
               "type": "string",
               "description": "Max requests per worker before restart",
-              "default": "10000"
+              "default": "100000"
             },
             "GUNICORN_MAX_REQUESTS_JITTER": {
               "type": "string",
@@ -345,6 +449,18 @@
               "type": "string",
               "enum": ["true", "false"],
               "description": "Preload app code before forking workers",
+              "default": "true"
+            },
+            "GUNICORN_DEV_MODE": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Developer mode with hot reload (not for production)",
+              "default": "false"
+            },
+            "DISABLE_ACCESS_LOG": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Disable access logging for performance",
               "default": "true"
             },
             "APP_NAME": {
@@ -390,7 +506,7 @@
             "CACHE_TYPE": {
               "type": "string",
               "description": "Cache backend type",
-              "enum": ["redis", "memory", "database"],
+              "enum": ["redis", "memory", "none", "database"],
               "default": "redis"
             },
             "CACHE_PREFIX": {
@@ -410,23 +526,80 @@
             },
             "REDIS_MAX_RETRIES": {
               "type": "string",
-              "description": "Redis max retries",
-              "default": "3"
+              "description": "Max Redis connection retries at startup (uses exponential backoff with jitter)",
+              "default": "30"
             },
             "REDIS_RETRY_INTERVAL_MS": {
               "type": "string",
-              "description": "Redis retry interval in milliseconds",
+              "description": "Base retry interval in ms (doubles each attempt)",
               "default": "2000"
+            },
+            "REDIS_MAX_BACKOFF_SECONDS": {
+              "type": "string",
+              "description": "Max backoff cap in seconds (jitter ±25% applied after)",
+              "default": "30"
+            },
+            "REDIS_MAX_CONNECTIONS": {
+              "type": "string",
+              "description": "Redis connection pool size per worker",
+              "default": "50"
+            },
+            "REDIS_SOCKET_TIMEOUT": {
+              "type": "string",
+              "description": "Redis socket read/write timeout in seconds",
+              "default": "2.0"
+            },
+            "REDIS_SOCKET_CONNECT_TIMEOUT": {
+              "type": "string",
+              "description": "Redis connection timeout in seconds",
+              "default": "2.0"
+            },
+            "REDIS_RETRY_ON_TIMEOUT": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Retry Redis commands on timeout",
+              "default": "true"
+            },
+            "REDIS_HEALTH_CHECK_INTERVAL": {
+              "type": "string",
+              "description": "Redis health check interval in seconds (0=disabled)",
+              "default": "30"
+            },
+            "REDIS_DECODE_RESPONSES": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Return strings instead of bytes from Redis",
+              "default": "true"
+            },
+            "REDIS_LEADER_TTL": {
+              "type": "string",
+              "description": "Redis leader election TTL in seconds",
+              "default": "15"
+            },
+            "REDIS_LEADER_KEY": {
+              "type": "string",
+              "description": "Redis leader election key name",
+              "default": "gateway_service_leader"
+            },
+            "REDIS_LEADER_HEARTBEAT_INTERVAL": {
+              "type": "string",
+              "description": "Redis leader heartbeat interval in seconds",
+              "default": "5"
             },
             "DB_MAX_RETRIES": {
               "type": "string",
-              "description": "Database max retries",
-              "default": "3"
+              "description": "Max DB connection retries at startup (uses exponential backoff with jitter)",
+              "default": "30"
             },
             "DB_RETRY_INTERVAL_MS": {
               "type": "string",
-              "description": "Database retry interval in milliseconds",
+              "description": "Base retry interval in ms (doubles each attempt)",
               "default": "2000"
+            },
+            "DB_MAX_BACKOFF_SECONDS": {
+              "type": "string",
+              "description": "Max backoff cap in seconds (jitter ±25% applied after)",
+              "default": "30"
             },
             "PROTOCOL_VERSION": {
               "type": "string",
@@ -563,6 +736,17 @@
               "description": "Log format",
               "default": "json"
             },
+            "LOG_REQUESTS": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Enable request payload logging with sensitive data masking",
+              "default": "false"
+            },
+            "LOG_DETAILED_MAX_BODY_SIZE": {
+              "type": "string",
+              "description": "Maximum request body size to log in detailed mode (bytes)",
+              "default": "16384"
+            },
             "TRANSPORT_TYPE": {
               "type": "string",
               "description": "Transport types (comma-separated)",
@@ -590,32 +774,10 @@
               "description": "Enable JSON responses",
               "default": "true"
             },
-            "FEDERATION_ENABLED": {
-              "type": "string",
-              "enum": ["true", "false"],
-              "description": "Enable federation",
-              "default": "true"
-            },
-            "FEDERATION_DISCOVERY": {
-              "type": "string",
-              "enum": ["true", "false"],
-              "description": "Enable federation discovery",
-              "default": "false"
-            },
-            "FEDERATION_PEERS": {
-              "type": "string",
-              "description": "Federation peers (JSON array)",
-              "default": "[]"
-            },
             "FEDERATION_TIMEOUT": {
               "type": "string",
-              "description": "Federation timeout in seconds",
-              "default": "30"
-            },
-            "FEDERATION_SYNC_INTERVAL": {
-              "type": "string",
-              "description": "Federation sync interval in seconds",
-              "default": "300"
+              "description": "HTTP timeout in seconds for gateway and MCP server requests (health checks, tool invocations)",
+              "default": "120"
             },
             "RESOURCE_CACHE_SIZE": {
               "type": "string",
@@ -677,10 +839,21 @@
               "description": "Health check timeout in seconds",
               "default": "10"
             },
+            "GATEWAY_HEALTH_CHECK_TIMEOUT": {
+              "type": "string",
+              "description": "Per-check timeout to bound total time of one gateway health check (seconds)",
+              "default": "5.0"
+            },
             "UNHEALTHY_THRESHOLD": {
               "type": "string",
               "description": "Unhealthy threshold",
               "default": "3"
+            },
+            "AUTO_REFRESH_SERVERS": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Enable automatic tools/prompts/resources refresh from the mcp servers during gateway health checks",
+              "default": "false"
             },
             "FILELOCK_NAME": {
               "type": "string",
@@ -697,6 +870,12 @@
               "type": "string",
               "enum": ["true", "false"],
               "description": "Enable auto-reload",
+              "default": "false"
+            },
+            "TEMPLATES_AUTO_RELOAD": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Auto-reload Jinja2 templates on change (disable for production performance)",
               "default": "false"
             },
             "DEBUG": {
@@ -771,6 +950,18 @@
             "REDIS_URL": {
               "type": "string",
               "description": "Redis URL override"
+            },
+            "METRICS_CACHE_ENABLED": {
+              "type": "string",
+              "enum": ["true", "false"],
+              "description": "Enable metrics aggregation query caching (reduces full table scans)",
+              "default": "true"
+            },
+            "METRICS_CACHE_TTL_SECONDS": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,2}$",
+              "description": "TTL for cached metrics in seconds (1-300, default: 60)",
+              "default": "60"
             }
           },
           "additionalProperties": true
@@ -886,6 +1077,33 @@
           "type": "boolean",
           "description": "Enable PostgreSQL",
           "default": true
+        },
+        "external": {
+          "type": "object",
+          "description": "External PostgreSQL configuration",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable external PostgreSQL",
+              "default": false
+            },
+            "existingSecret": {
+              "type": "string",
+              "description": "Secret containing connection details",
+              "default": ""
+            },
+            "host": { "type": "string" },
+            "hostKey": { "type": "string", "default": "host" },
+            "port": { "type": "integer", "default": 5432 },
+            "portKey": { "type": "string", "default": "port" },
+            "database": { "type": "string" },
+            "databaseKey": { "type": "string", "default": "dbname" },
+            "user": { "type": "string" },
+            "userKey": { "type": "string", "default": "user" },
+            "password": { "type": "string" },
+            "passwordKey": { "type": "string", "default": "password" }
+          },
+          "additionalProperties": false
         },
         "image": {
           "type": "object",
@@ -1046,6 +1264,143 @@
               "type": "boolean",
               "description": "Flag to indicate if backup has been completed to prevent re-running",
               "default": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "pgbouncer": {
+      "type": "object",
+      "description": "PgBouncer connection pooler configuration",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable PgBouncer connection pooling",
+          "default": false
+        },
+        "image": {
+          "type": "object",
+          "description": "PgBouncer image configuration",
+          "properties": {
+            "repository": {
+              "type": "string",
+              "description": "Image repository",
+              "default": "edoburu/pgbouncer"
+            },
+            "tag": {
+              "type": "string",
+              "description": "Image tag",
+              "default": "latest"
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": ["Always", "IfNotPresent", "Never"],
+              "description": "Image pull policy",
+              "default": "IfNotPresent"
+            }
+          },
+          "additionalProperties": false
+        },
+        "service": {
+          "type": "object",
+          "description": "PgBouncer service configuration",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["ClusterIP", "NodePort", "LoadBalancer"],
+              "description": "Service type",
+              "default": "ClusterIP"
+            },
+            "port": {
+              "type": "integer",
+              "description": "Service port",
+              "minimum": 1,
+              "maximum": 65535,
+              "default": 6432
+            }
+          },
+          "additionalProperties": false
+        },
+        "pool": {
+          "type": "object",
+          "description": "Pool configuration",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["transaction", "session", "statement"],
+              "description": "Pool mode",
+              "default": "transaction"
+            },
+            "maxClientConn": {
+              "type": "integer",
+              "description": "Max client connections",
+              "default": 3000
+            },
+            "defaultPoolSize": {
+              "type": "integer",
+              "description": "Default pool size",
+              "default": 120
+            },
+            "minPoolSize": {
+              "type": "integer",
+              "description": "Minimum pool size",
+              "default": 10
+            },
+            "reservePoolSize": {
+              "type": "integer",
+              "description": "Reserve pool size",
+              "default": 25
+            },
+            "reservePoolTimeout": {
+              "type": "integer",
+              "description": "Reserve pool timeout in seconds",
+              "default": 5
+            },
+            "maxDbConnections": {
+              "type": "integer",
+              "description": "Max database connections",
+              "default": 200
+            },
+            "maxUserConnections": {
+              "type": "integer",
+              "description": "Max user connections",
+              "default": 200
+            },
+            "serverLifetime": {
+              "type": "integer",
+              "description": "Server lifetime in seconds",
+              "default": 3600
+            },
+            "serverIdleTimeout": {
+              "type": "integer",
+              "description": "Server idle timeout in seconds",
+              "default": 600
+            }
+          },
+          "additionalProperties": false
+        },
+        "authType": {
+          "type": "string",
+          "description": "Authentication type",
+          "default": "scram-sha-256"
+        },
+        "resources": {
+          "$ref": "#/$defs/resources",
+          "description": "Resource limits and requests"
+        },
+        "probes": {
+          "type": "object",
+          "description": "PgBouncer health probes",
+          "properties": {
+            "readiness": {
+              "$ref": "#/$defs/probe",
+              "description": "Readiness probe"
+            },
+            "liveness": {
+              "$ref": "#/$defs/probe",
+              "description": "Liveness probe"
             }
           },
           "additionalProperties": false

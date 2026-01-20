@@ -118,6 +118,10 @@ class PermissionService:
             if not granted and permission.startswith("teams."):
                 granted = await self._check_team_fallback_permissions(user_email, permission, team_id)
 
+            # If no explicit permissions found, check fallback permissions for token operations
+            if not granted and permission.startswith("tokens."):
+                granted = await self._check_token_fallback_permissions(user_email, permission)
+
             # Log the permission check if auditing is enabled
             if self.audit_enabled:
                 await self._log_permission_check(
@@ -219,7 +223,8 @@ class PermissionService:
             query = query.where((UserRole.expires_at.is_(None)) | (UserRole.expires_at > now))
 
         result = self.db.execute(query)
-        return result.scalars().all()
+        user_roles = result.scalars().all()
+        return user_roles
 
     async def has_permission_on_resource(self, user_email: str, permission: str, resource_type: str, resource_id: str, team_id: Optional[str] = None) -> bool:
         """Check if user has permission on a specific resource.
@@ -398,7 +403,8 @@ class PermissionService:
         query = query.where((UserRole.expires_at.is_(None)) | (UserRole.expires_at > now))
 
         result = self.db.execute(query)
-        return result.scalars().all()
+        user_roles = result.scalars().all()
+        return user_roles
 
     async def _log_permission_check(
         self,
@@ -541,6 +547,7 @@ class PermissionService:
         from mcpgateway.db import EmailTeamMember  # pylint: disable=import-outside-toplevel
 
         member = self.db.execute(select(EmailTeamMember).where(and_(EmailTeamMember.user_email == user_email, EmailTeamMember.team_id == team_id, EmailTeamMember.is_active))).scalar_one_or_none()
+        self.db.commit()  # Release transaction to avoid idle-in-transaction
 
         return member is not None
 
@@ -558,5 +565,26 @@ class PermissionService:
         from mcpgateway.db import EmailTeamMember  # pylint: disable=import-outside-toplevel
 
         member = self.db.execute(select(EmailTeamMember).where(and_(EmailTeamMember.user_email == user_email, EmailTeamMember.team_id == team_id, EmailTeamMember.is_active))).scalar_one_or_none()
+        self.db.commit()  # Release transaction to avoid idle-in-transaction
 
         return member.role if member else None
+
+    async def _check_token_fallback_permissions(self, _user_email: str, permission: str) -> bool:
+        """Check fallback token permissions for authenticated users.
+
+        All authenticated users can manage their own tokens. The token endpoints
+        already filter by user_email, so this just grants access to the endpoints.
+
+        Args:
+            _user_email: Email address of the user (unused)
+            permission: Permission being checked
+
+        Returns:
+            bool: True if user has fallback permission for token operations
+        """
+        # Any authenticated user can create, read, update, and revoke their own tokens
+        # The actual filtering by user_email happens in the token service layer
+        if permission in ["tokens.create", "tokens.read", "tokens.update", "tokens.revoke"]:
+            return True
+
+        return False

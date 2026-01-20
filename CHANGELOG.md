@@ -4,6 +4,157 @@
 
 ---
 
+## [1.0.0-BETA-2] - TBD
+
+### Added
+
+#### **🎛️ Execution Metrics Recording Switch** ([#1804](https://github.com/IBM/mcp-context-forge/issues/1804))
+* **New setting** `DB_METRICS_RECORDING_ENABLED` - Disable execution metrics database writes
+  - Controls tool/resource/prompt/server/A2A metrics recording (one DB row per operation)
+  - Set `DB_METRICS_RECORDING_ENABLED=false` to disable when using external observability
+  - Does NOT affect log aggregation (`METRICS_AGGREGATION_ENABLED`) or Prometheus (`ENABLE_METRICS`)
+  - Default: `true` (existing behavior unchanged)
+
+#### **🔐 RFC 8707 OAuth Resource Indicators for JWT Tokens**
+* **OAuth JWT token support** - Enables OAuth providers to return JWT tokens instead of opaque tokens
+  - Adds RFC 8707 `resource` parameter to OAuth authorization, token exchange, and refresh requests
+  - Automatically derives `resource` from the MCP server URL (`gateway.url`), normalized per RFC 8707
+  - Fixes "Invalid Compact JWS" errors when OAuth providers (e.g., BetterAuth) default to opaque tokens
+  - No configuration changes required for most OAuth providers
+  - Note: Providers requiring pre-registered resource identifiers may need explicit `resource` configuration
+
+### Deprecated
+
+#### **🔌 Federation Auto-Discovery & Forwarding Services** ([#1912](https://github.com/IBM/mcp-context-forge/issues/1912))
+* **Removed `DiscoveryService`** - mDNS/Zeroconf auto-discovery is no longer supported
+* **Removed `ForwardingService`** - Functionality consolidated into `ToolService` with improved OAuth, plugin, and SSE support
+* **Deprecated environment variables:**
+  - `FEDERATION_ENABLED` - No longer used
+  - `FEDERATION_DISCOVERY` - No longer used
+  - `FEDERATION_PEERS` - No longer used
+  - `FEDERATION_SYNC_INTERVAL` - No longer used
+* **Retained:** `FEDERATION_TIMEOUT` for gateway request timeouts
+* **Unaffected:** Gateway peer management via `/gateways` REST API remains fully functional
+
+### Changed
+
+#### **⚡ Metrics Performance Defaults** ([#1799](https://github.com/IBM/mcp-context-forge/issues/1799))
+* **Changed default behavior** - Raw metrics now deleted after hourly rollups exist (1 hour retention)
+  - `METRICS_DELETE_RAW_AFTER_ROLLUP`: `false` → `true`
+  - `METRICS_DELETE_RAW_AFTER_ROLLUP_DAYS` → `METRICS_DELETE_RAW_AFTER_ROLLUP_HOURS` (units now hours)
+  - `METRICS_DELETE_RAW_AFTER_ROLLUP_HOURS`: `168` → `1`
+  - `METRICS_ROLLUP_LATE_DATA_HOURS`: `4` → `1`
+  - `METRICS_CLEANUP_INTERVAL_HOURS`: `24` → `1`
+  - `METRICS_RETENTION_DAYS`: `30` → `7`
+* **Rationale**: Prevents unbounded table growth under sustained load while preserving analytics in hourly rollups
+* **Opt-out**: Set `METRICS_DELETE_RAW_AFTER_ROLLUP=false` to preserve previous behavior
+* **External observability**: If using ELK, Datadog, or similar platforms, raw metrics are redundant - the new defaults are optimal
+
+## [1.0.0-BETA-1] - 2025-12-16 - Multi-Architecture Containers, gRPC Translation, Performance & Security Enhancements
+
+### Overview
+
+This release marks the first beta milestone toward 1.0.0 GA, delivering **multi-architecture container support**, **gRPC-to-MCP protocol translation**, **air-gapped deployment capabilities**, and **significant performance improvements** with **25+ issues resolved**:
+
+- **🏗️ Multi-Architecture Containers** - ARM64 and s390x architecture support for broader deployment options
+- **🔌 gRPC-to-MCP Translation** - Experimental gRPC service interface for MCP protocol operations
+- **🌐 Air-Gapped Deployment** - CDN asset bundling for fully offline/disconnected environments
+- **⚡ Performance Improvements** - Concurrent health checks and N+1 query optimizations reducing gateway operations latency by 10x+
+- **🔐 Security Enhancements** - Password expiration policies, one-time authentication, and input validation
+- **🛠️ Developer Experience** - Performance benchmarking framework, test resource buttons, and improved bulk import feedback
+- **🗄️ Database Support** - Enhanced MariaDB documentation and testing
+
+### 🎉 Announcements
+
+#### **🖥️ ContextForge Desktop App**
+We're excited to announce the **ContextForge Desktop** application - a native desktop client for managing MCP servers and gateways:
+- **Repository:** [contextforge-org/contextforge-desktop](https://github.com/contextforge-org/contextforge-desktop)
+- Cross-platform support (Windows, macOS, Linux)
+- Visual MCP server management and monitoring
+- Integrated gateway configuration
+
+#### **⌨️ ContextForge CLI**
+A new command-line interface for ContextForge operations:
+- **Repository:** [contextforge-org/contextforge-cli](https://github.com/contextforge-org/contextforge-cli)
+- Scriptable MCP server and gateway management
+- CI/CD integration support
+- Configuration export/import utilities
+
+#### **🏢 New ContextForge Organization**
+We've established the [contextforge-org](https://github.com/contextforge-org) GitHub organization to host the growing ContextForge ecosystem. In upcoming releases, several components will migrate to this organization:
+- Plugins
+- MCP Servers
+- Agent runtimes
+- Desktop and CLI tools
+
+> **Note:** The main gateway repository remains at [IBM/mcp-context-forge](https://github.com/IBM/mcp-context-forge).
+
+### Added
+
+#### **🏗️ Multi-Architecture Container Support** ([#80](https://github.com/IBM/mcp-context-forge/issues/80), [#1138](https://github.com/IBM/mcp-context-forge/issues/1138))
+* **ARM64 Support** - Container images now available for ARM64 architecture (Apple Silicon, AWS Graviton)
+* **s390x Support** - IBM Z/LinuxONE architecture support for enterprise mainframe deployments
+* **Multi-Platform Builds** - Automated CI/CD pipeline produces `linux/amd64`, `linux/arm64`, and `linux/s390x` images
+
+#### **🔌 gRPC-to-MCP Protocol Translation** ([#1171](https://github.com/IBM/mcp-context-forge/issues/1171))
+* **Experimental gRPC Service** - New gRPC interface for MCP protocol operations
+  - Tool listing, discovery, and invocation via gRPC
+  - Resource and prompt management endpoints
+  - Server health and capability queries
+* **Protocol Buffers** - Well-defined `.proto` schemas for type-safe client generation
+* **Optional Dependency** - Install with `pip install mcp-contextforge-gateway[grpc]`
+
+#### **🌐 Air-Gapped Environment Support** ([#932](https://github.com/IBM/mcp-context-forge/issues/932))
+* **CDN Asset Bundling** - All frontend assets (HTMX, Alpine.js, CSS) bundled in container image
+* **Offline Deployment** - No external network requests required for Admin UI
+* **Asset Download Script** - `scripts/download-cdn-assets.sh` for manual asset updates
+
+#### **🔐 Password Expiration & Security** ([#1282](https://github.com/IBM/mcp-context-forge/issues/1282), [#1387](https://github.com/IBM/mcp-context-forge/issues/1387))
+* **Configurable Password Expiration** - Set password validity periods via `PASSWORD_EXPIRY_DAYS`
+* **Forced Password Change** - Users prompted to change expired passwords on login
+* **One-Time Authentication Mode** - Support for WXO integration with single-use auth tokens
+* **Multiple Gateway Registrations** - Allow same gateway URL with different authentication contexts ([#1392](https://github.com/IBM/mcp-context-forge/issues/1392))
+
+#### **🧪 Performance Testing Framework** ([#1203](https://github.com/IBM/mcp-context-forge/issues/1203), [#1219](https://github.com/IBM/mcp-context-forge/issues/1219))
+* **Benchmarking Framework** - Comprehensive performance testing infrastructure
+* **Benchmark MCP Server** - Dedicated server for load testing and performance analysis
+* **N+1 Query Detection** - Automated tests to catch database query performance regressions
+
+#### **📦 Sample MCP Servers**
+* **Go System Monitor Server** ([#898](https://github.com/IBM/mcp-context-forge/issues/898)) - Reference implementation in Go for system monitoring
+
+#### **🛠️ Developer Experience Improvements**
+* **Test Button for Resources** ([#1560](https://github.com/IBM/mcp-context-forge/issues/1560)) - Quick resource testing from Admin UI
+* **Tool Tag Structure** ([#1442](https://github.com/IBM/mcp-context-forge/issues/1442)) - Enhanced tag structure with metadata support (objects instead of strings)
+* **Authentication Plugin Architecture** ([#1019](https://github.com/IBM/mcp-context-forge/issues/1019)) - Extensible authentication through plugin system
+* **Bulk Import Feedback** ([#806](https://github.com/IBM/mcp-context-forge/issues/806)) - Improved error messages and registration feedback in UI
+
+### Fixed
+
+#### **⚡ Performance Fixes**
+* **Concurrent Health Checks** ([#1522](https://github.com/IBM/mcp-context-forge/issues/1522)) - Gateway health checks now run in parallel instead of sequentially, reducing latency from O(n) to O(1)
+* **N+1 Query Elimination** ([#1523](https://github.com/IBM/mcp-context-forge/issues/1523)) - Major performance fix for gateway/tool/server services, reducing database queries by 90%+ in multi-gateway scenarios
+
+#### **🐛 Bug Fixes**
+* **Gateway Status Updates** ([#464](https://github.com/IBM/mcp-context-forge/issues/464)) - MCP Server "Active" status now properly updates when servers shutdown
+* **Resource Listing** ([#1259](https://github.com/IBM/mcp-context-forge/issues/1259)) - Fixed MCP resources not appearing in listings
+* **StreamableHTTP Redirects** ([#1280](https://github.com/IBM/mcp-context-forge/issues/1280)) - Proper redirect handling in gateway URL validation
+* **Tool Schema team_id** ([#1395](https://github.com/IBM/mcp-context-forge/issues/1395)) - Team ID now correctly applied in tool schemas
+* **Virtual Server Structured Content** ([#1406](https://github.com/IBM/mcp-context-forge/issues/1406)) - Fixed missing structured content in Streamable HTTP responses
+* **One-Time Auth Gateway Registration** ([#1448](https://github.com/IBM/mcp-context-forge/issues/1448)) - Multiple gateways with same URL now supported with one-time auth
+* **SSL Key Passphrase** ([#1577](https://github.com/IBM/mcp-context-forge/issues/1577)) - Support for passphrase-protected SSL keys in HTTPS configuration
+
+### Security
+
+* **Input Validation & Output Sanitization** ([#221](https://github.com/IBM/mcp-context-forge/issues/221)) - Gateway-level input validation to prevent path traversal and injection attacks
+
+### Changed
+
+#### **🗄️ Database Support**
+* **MariaDB Documentation** ([#288](https://github.com/IBM/mcp-context-forge/issues/288)) - Comprehensive MariaDB testing, documentation, and CI/CD integration
+
+---
+
 ## [0.9.0] - 2025-11-09 - REST Passthrough, Ed25519 Certificate Signing, Multi-Tenancy Fixes & Platform Enhancements
 
 ### Overview
@@ -604,7 +755,7 @@ This release focuses on **Advanced OAuth Integration, Plugin Ecosystem, MCP Regi
   - `GET /grpc` - List all gRPC services with team filtering
   - `GET /grpc/{id}` - Get service details
   - `PUT /grpc/{id}` - Update service configuration
-  - `POST /grpc/{id}/toggle` - Enable/disable service
+  - `POST /grpc/{id}/state` - Enable/disable service
   - `POST /grpc/{id}/delete` - Delete service
   - `POST /grpc/{id}/reflect` - Re-trigger service discovery
   - `GET /grpc/{id}/methods` - List discovered methods
@@ -1711,7 +1862,7 @@ This release represents a true community effort with contributions from develope
   ```bash
   VALIDATION_MAX_NAME_LENGTH=255
   VALIDATION_MAX_DESCRIPTION_LENGTH=4096
-  VALIDATION_MAX_JSON_DEPTH=10
+  VALIDATION_MAX_JSON_DEPTH=30
   VALIDATION_ALLOWED_URL_SCHEMES=["http://", "https://", "ws://", "wss://"]
   ```
 

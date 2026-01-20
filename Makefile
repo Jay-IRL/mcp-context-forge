@@ -91,12 +91,12 @@ os-deps: $(OS_DEPS_SCRIPT)
 # -----------------------------------------------------------------------------
 # 🔧 HELPER SCRIPTS
 # -----------------------------------------------------------------------------
-# Helper to ensure a Python package is installed in venv
+# Helper to ensure a Python package is installed in venv (uses uv to avoid pip corruption)
 define ensure_pip_package
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip show $(1) >/dev/null 2>&1 || \
-		python3 -m pip install -q $(1)"
+		uv pip show $(1) >/dev/null 2>&1 || \
+		uv pip install -q $(1)"
 endef
 
 # =============================================================================
@@ -112,7 +112,7 @@ endef
 # help: update               - Update all installed deps inside the venv
 .PHONY: uv
 uv:
-	@if ! type uv >/dev/null 2>&1; then \
+	@if ! type uv >/dev/null 2>&1 && ! test -x "$(HOME)/.local/bin/uv"; then \
 		echo "🔧 'uv' not found - installing..."; \
 		if type brew >/dev/null 2>&1; then \
 			echo "🍺 Installing 'uv' via Homebrew..."; \
@@ -120,19 +120,17 @@ uv:
 		else \
 			echo "🐍 Installing 'uv' via local install script..."; \
 			curl -LsSf https://astral.sh/uv/install.sh | sh ; \
-			echo "💡  Make sure to add 'uv' to your PATH if not done automatically."; \
 		fi; \
 	fi
 
+# UV_BIN: prefer uv in PATH, fallback to ~/.local/bin/uv
+UV_BIN := $(shell type -p uv 2>/dev/null || echo "$(HOME)/.local/bin/uv")
+
 .PHONY: venv
-venv:
+venv: uv
 	@rm -Rf "$(VENV_DIR)"
 	@test -d "$(VENVS_DIR)" || mkdir -p "$(VENVS_DIR)"
-	@python3 -m venv "$(VENV_DIR)"
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && python3 -m pip install --upgrade pip setuptools pdm"
-	# Eventually, we want to transition to using uv/uvx exclusively, at which point we will only need
-	# a virtual environment if the user has not installed uv into their account.
-	@/bin/bash -c "type uv || ( source $(VENV_DIR)/bin/activate && python3 -m pip install --upgrade uv )"
+	@$(UV_BIN) venv "$(VENV_DIR)"
 	@echo -e "✅  Virtual env created.\n💡  Enter it with:\n    . $(VENV_DIR)/bin/activate\n"
 
 .PHONY: activate
@@ -195,20 +193,54 @@ check-env-dev:
 # help: certs-mcp-check      - Check expiry dates of MCP certificates
 # help: serve-ssl            - Run Gunicorn behind HTTPS on :4444 (uses ./certs)
 # help: dev                  - Run fast-reload dev server (uvicorn)
+# help: dev-echo             - Run dev server with SQL query logging (N+1 debugging)
+# help: stop                 - Stop all mcpgateway server processes
+# help: stop-dev             - Stop uvicorn dev server (port 8000)
+# help: stop-serve           - Stop gunicorn production server (port 4444)
 # help: run                  - Execute helper script ./run.sh
 
-.PHONY: serve serve-ssl dev run certs certs-jwt certs-jwt-ecdsa certs-all \
-        certs-mcp-ca certs-mcp-gateway certs-mcp-plugin certs-mcp-all certs-mcp-check
+.PHONY: serve serve-ssl serve-granian serve-granian-ssl serve-granian-http2 dev stop stop-dev stop-serve run \
+        certs certs-jwt certs-jwt-ecdsa certs-all certs-mcp-ca certs-mcp-gateway certs-mcp-plugin certs-mcp-all certs-mcp-check
 
 ## --- Primary servers ---------------------------------------------------------
-serve:
+serve:                           ## Run production server with Gunicorn + Uvicorn (default)
 	./run-gunicorn.sh
 
-serve-ssl: certs
+serve-ssl: certs                 ## Run Gunicorn with TLS enabled
 	SSL=true CERT_FILE=certs/cert.pem KEY_FILE=certs/key.pem ./run-gunicorn.sh
 
+serve-granian:                   ## Run production server with Granian (Rust-based, alternative)
+	./run-granian.sh
+
+serve-granian-ssl: certs         ## Run Granian with TLS enabled
+	SSL=true CERT_FILE=certs/cert.pem KEY_FILE=certs/key.pem ./run-granian.sh
+
+serve-granian-http2: certs       ## Run Granian with HTTP/2 and TLS
+	SSL=true GRANIAN_HTTP=2 CERT_FILE=certs/cert.pem KEY_FILE=certs/key.pem ./run-granian.sh
+
 dev:
-	@$(VENV_DIR)/bin/uvicorn mcpgateway.main:app --host 0.0.0.0 --port 8000 --reload --reload-exclude='public/'
+	@TEMPLATES_AUTO_RELOAD=true $(VENV_DIR)/bin/uvicorn mcpgateway.main:app --host 0.0.0.0 --port 8000 --reload --reload-exclude='public/'
+
+dev-echo:                        ## Run dev server with SQL query logging enabled
+	@echo "🔍 Starting dev server with SQL query logging (N+1 detection)"
+	@echo "   Docs: docs/docs/development/db-performance.md"
+	@SQLALCHEMY_ECHO=true TEMPLATES_AUTO_RELOAD=true $(VENV_DIR)/bin/uvicorn mcpgateway.main:app --host 0.0.0.0 --port 8000 --reload --reload-exclude='public/'
+
+stop:                            ## Stop all mcpgateway server processes
+	@echo "Stopping all mcpgateway processes..."
+	@if [ -f /tmp/mcpgateway-gunicorn.lock ]; then kill -9 $$(cat /tmp/mcpgateway-gunicorn.lock) 2>/dev/null || true; rm -f /tmp/mcpgateway-gunicorn.lock; fi
+	@if [ -f /tmp/mcpgateway-granian.lock ]; then kill -9 $$(cat /tmp/mcpgateway-granian.lock) 2>/dev/null || true; rm -f /tmp/mcpgateway-granian.lock; fi
+	@lsof -ti:8000 2>/dev/null | xargs -r kill -9 || true
+	@lsof -ti:4444 2>/dev/null | xargs -r kill -9 || true
+	@echo "Done."
+
+stop-dev:                        ## Stop uvicorn dev server (port 8000)
+	@lsof -ti:8000 2>/dev/null | xargs -r kill -9 || true
+
+stop-serve:                      ## Stop gunicorn production server (port 4444)
+	@if [ -f /tmp/mcpgateway-gunicorn.lock ]; then kill -9 $$(cat /tmp/mcpgateway-gunicorn.lock) 2>/dev/null || true; rm -f /tmp/mcpgateway-gunicorn.lock; fi
+	@lsof -ti:4444 2>/dev/null | xargs -r kill -9 || true
+
 run:
 	./run.sh
 
@@ -458,6 +490,7 @@ clean:
 # help: 🧪 TESTING
 # help: smoketest            - Run smoketest.py --verbose (build container, add MCP server, test endpoints)
 # help: test                 - Run unit tests with pytest
+# help: test-altk            - Run tests with ALTK (agent-lifecycle-toolkit) installed
 # help: test-profile         - Run tests and show slowest 20 tests (durations >= 1s)
 # help: coverage             - Run tests with coverage, emit md/HTML/XML + badge, generate annotated files
 # help: htmlcov              - (re)build just the HTML coverage report into docs
@@ -467,8 +500,14 @@ clean:
 # help: doctest-verbose      - Run doctest with detailed output (-v flag)
 # help: doctest-coverage     - Generate coverage report for doctest examples
 # help: doctest-check        - Check doctest coverage percentage (fail if < 100%)
+# help: test-db-perf         - Run database performance and N+1 query detection tests
+# help: test-db-perf-verbose - Run database performance tests with full SQL query output
+# help: dev-query-log        - Run dev server with query logging to file (N+1 detection)
+# help: query-log-tail       - Tail the database query log file
+# help: query-log-analyze    - Analyze query log for N+1 patterns and slow queries
+# help: query-log-clear      - Clear database query log files
 
-.PHONY: smoketest test test-profile coverage pytest-examples test-curl htmlcov doctest doctest-verbose doctest-coverage doctest-check
+.PHONY: smoketest test test-altk test-profile coverage pytest-examples test-curl htmlcov doctest doctest-verbose doctest-coverage doctest-check test-db-perf test-db-perf-verbose dev-query-log query-log-tail query-log-analyze query-log-clear load-test load-test-ui load-test-light load-test-heavy load-test-sustained load-test-stress load-test-report load-test-compose load-test-timeserver load-test-fasttime load-test-1000 load-test-summary load-test-baseline load-test-baseline-ui load-test-baseline-stress load-test-agentgateway-mcp-server-time
 
 ## --- Automated checks --------------------------------------------------------
 smoketest:
@@ -484,7 +523,21 @@ test:
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
 		export DATABASE_URL='sqlite:///:memory:' && \
 		export TEST_DATABASE_URL='sqlite:///:memory:' && \
-		uv run --active pytest -n auto --maxfail=0 -v --ignore=tests/fuzz"
+		export ARGON2ID_TIME_COST=1 && \
+		export ARGON2ID_MEMORY_COST=1024 && \
+		uv run --active pytest -n 16 --maxfail=0 -v --ignore=tests/fuzz"
+
+test-altk:
+	@echo "🧪 Running tests with ALTK (agent-lifecycle-toolkit)..."
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		echo '📦 Installing ALTK optional dependency...' && \
+		uv pip install -q '.[altk]' && \
+		export DATABASE_URL='sqlite:///:memory:' && \
+		export TEST_DATABASE_URL='sqlite:///:memory:' && \
+		export ARGON2ID_TIME_COST=1 && \
+		export ARGON2ID_MEMORY_COST=1024 && \
+		uv run --active pytest -n 16 --maxfail=0 -v --ignore=tests/fuzz"
 
 test-profile:
 	@echo "🧪 Running tests with profiling (showing slowest tests)..."
@@ -492,7 +545,9 @@ test-profile:
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
 		export DATABASE_URL='sqlite:///:memory:' && \
 		export TEST_DATABASE_URL='sqlite:///:memory:' && \
-		uv run --active pytest -n auto --durations=20 --durations-min=1.0 --disable-warnings -v --ignore=tests/fuzz"
+		export ARGON2ID_TIME_COST=1 && \
+		export ARGON2ID_MEMORY_COST=1024 && \
+		uv run --active pytest -n 16 --durations=20 --durations-min=1.0 --disable-warnings -v --ignore=tests/fuzz"
 
 coverage:
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
@@ -534,7 +589,7 @@ pytest-examples:
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@test -f test_readme.py || { echo "⚠️  test_readme.py not found - skipping"; exit 0; }
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q pytest pytest-examples && \
+		uv pip install -q pytest pytest-examples && \
 		pytest -v test_readme.py"
 
 test-curl:
@@ -546,14 +601,14 @@ doctest:
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
 		export JWT_SECRET_KEY=secret && \
-		python3 -m pytest --doctest-modules mcpgateway/ --ignore=mcpgateway/utils/pagination.py --tb=short --no-cov --disable-warnings -n auto"
+		python3 -m pytest --doctest-modules mcpgateway/ --ignore=mcpgateway/utils/pagination.py --tb=short --no-cov --disable-warnings -n 4"
 
 doctest-verbose:
 	@echo "🧪 Running doctest with verbose output..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
 		export JWT_SECRET_KEY=secret && \
-		python3 -m pytest --doctest-modules mcpgateway/ --ignore=mcpgateway/utils/pagination.py -v --tb=short --no-cov --disable-warnings -n auto"
+		python3 -m pytest --doctest-modules mcpgateway/ --ignore=mcpgateway/utils/pagination.py -v --tb=short --no-cov --disable-warnings -n 4"
 
 doctest-coverage:
 	@echo "📊 Generating doctest coverage report..."
@@ -571,6 +626,51 @@ doctest-check:
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
 		python3 -m pytest --doctest-modules mcpgateway/ --tb=no -q && \
 		echo '✅ All doctests passing' || (echo '❌ Doctest failures detected' && exit 1)"
+
+## --- Database Performance Testing --------------------------------------------
+test-db-perf:                    ## Run database performance and N+1 detection tests
+	@echo "🔍 Running database performance tests..."
+	@echo "   Tip: Use 'make dev-echo' to debug queries in dev server"
+	@echo "   Docs: docs/docs/development/db-performance.md"
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		export DATABASE_URL='sqlite:///:memory:' && \
+		export TEST_DATABASE_URL='sqlite:///:memory:' && \
+		uv run --active pytest tests/performance/test_db_query_patterns.py -v --tb=short"
+
+test-db-perf-verbose:            ## Run database performance tests with full SQL query output
+	@echo "🔍 Running database performance tests with query logging..."
+	@echo "   All SQL queries will be printed to help identify N+1 patterns"
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		export DATABASE_URL='sqlite:///:memory:' && \
+		export TEST_DATABASE_URL='sqlite:///:memory:' && \
+		export SQLALCHEMY_ECHO=true && \
+		uv run --active pytest tests/performance/test_db_query_patterns.py -v -s --tb=short"
+
+dev-query-log:                   ## Run dev server with query logging to file
+	@echo "📊 Starting dev server with database query logging"
+	@echo "   Logs: logs/db-queries.log (text), logs/db-queries.jsonl (JSON)"
+	@echo "   Use 'make query-log-tail' in another terminal to watch queries"
+	@echo "   Docs: docs/docs/development/db-performance.md"
+	@mkdir -p logs
+	@DB_QUERY_LOG_ENABLED=true TEMPLATES_AUTO_RELOAD=true $(VENV_DIR)/bin/uvicorn mcpgateway.main:app --host 0.0.0.0 --port 8000 --reload --reload-exclude='public/'
+
+query-log-tail:                  ## Tail the database query log file
+	@echo "📊 Tailing logs/db-queries.log (Ctrl+C to stop)"
+	@echo "   Start server with 'make dev-query-log' to generate queries"
+	@tail -f logs/db-queries.log 2>/dev/null || echo "No log file yet. Start server with 'make dev-query-log' first."
+
+query-log-analyze:               ## Analyze query log for N+1 patterns
+	@echo "📊 Analyzing database query log..."
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		python3 -m mcpgateway.utils.analyze_query_log"
+
+query-log-clear:                 ## Clear database query log files
+	@echo "🗑️  Clearing database query logs..."
+	@rm -f logs/db-queries.log logs/db-queries.jsonl
+	@echo "✅ Query logs cleared"
 
 
 # =============================================================================
@@ -664,6 +764,714 @@ generate-report:                           ## Display most recent load test repo
 	done || echo "❌ No reports found. Run 'make generate-small' first."
 
 # =============================================================================
+# 📊 MONITORING STACK - Prometheus + Grafana + Exporters
+# =============================================================================
+# help: 📊 MONITORING STACK
+# help: monitoring-up          - Start monitoring stack (Prometheus, Grafana, exporters)
+# help: monitoring-down        - Stop monitoring stack
+# help: monitoring-clean       - Stop and remove all monitoring data (volumes)
+# help: monitoring-status      - Show status of monitoring services
+# help: monitoring-logs        - Show monitoring stack logs
+
+# Compose command for monitoring (requires --profile support)
+# podman-compose < 1.1.0 doesn't support --profile, so prefer docker compose or podman compose
+COMPOSE_CMD_MONITOR := $(shell \
+	if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then \
+		echo "docker compose"; \
+	elif command -v podman &>/dev/null && podman compose version &>/dev/null 2>&1; then \
+		echo "podman compose"; \
+	else \
+		echo "docker-compose"; \
+	fi)
+
+monitoring-up:                             ## Start monitoring stack (Prometheus, Grafana, exporters)
+	@echo "📊 Starting monitoring stack..."
+	@echo "🔎 Preflight: checking host port 8080 (nginx)"
+	@if command -v ss >/dev/null 2>&1; then \
+		if ss -H -ltn 'sport = :8080' | grep -q .; then \
+			echo "⚠️  Port 8080 already in use; nginx can't bind to it."; \
+			ss -ltnp 'sport = :8080' || ss -ltn 'sport = :8080'; \
+			echo "   Stop the process or change the nginx host port mapping."; \
+			exit 1; \
+		fi; \
+	elif command -v lsof >/dev/null 2>&1; then \
+		if lsof -nP -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1; then \
+			echo "⚠️  Port 8080 already in use; nginx can't bind to it."; \
+			lsof -nP -iTCP:8080 -sTCP:LISTEN || true; \
+			echo "   Stop the process or change the nginx host port mapping."; \
+			exit 1; \
+		fi; \
+	else \
+		echo "ℹ️  Skipping port check (ss/lsof not found)."; \
+	fi
+	$(COMPOSE_CMD_MONITOR) --profile monitoring up -d
+	@echo "⏳ Waiting for Grafana to be ready..."
+	@for i in 1 2 3 4 5 6 7 8 9 10; do \
+		if curl -s -o /dev/null -w '' http://localhost:3000/api/health 2>/dev/null; then break; fi; \
+		sleep 2; \
+	done
+	@# Configure Grafana: star dashboard and set as home
+	@curl -s -X POST -u admin:changeme 'http://localhost:3000/api/user/stars/dashboard/uid/mcp-gateway-overview' >/dev/null 2>&1 || true
+	@curl -s -X PUT -u admin:changeme -H "Content-Type: application/json" -d '{"homeDashboardUID": "mcp-gateway-overview"}' 'http://localhost:3000/api/org/preferences' >/dev/null 2>&1 || true
+	@curl -s -X PUT -u admin:changeme -H "Content-Type: application/json" -d '{"homeDashboardUID": "mcp-gateway-overview"}' 'http://localhost:3000/api/user/preferences' >/dev/null 2>&1 || true
+	@echo ""
+	@echo "✅ Monitoring stack started!"
+	@echo ""
+	@echo "   🌐 Grafana:    http://localhost:3000 (admin/changeme)"
+	@echo "   🔥 Prometheus: http://localhost:9090"
+	@echo ""
+	@echo "   ★ MCP Gateway Overview (home dashboard):"
+	@echo "      • Gateway replicas, Nginx, PostgreSQL, Redis status"
+	@echo "      • Request rate, error rate, P95 latency"
+	@echo "      • Nginx connections and throughput"
+	@echo "      • Database queries and cache hit ratio"
+	@echo "      • Redis memory, ops/sec, hit rate"
+	@echo "      • Container CPU and memory usage"
+	@echo ""
+	@echo "   Run load test: make load-test-ui"
+
+monitoring-down:                           ## Stop monitoring stack
+	@echo "📊 Stopping monitoring stack..."
+	$(COMPOSE_CMD_MONITOR) --profile monitoring down
+	@echo "✅ Monitoring stack stopped."
+
+monitoring-status:                         ## Show status of monitoring services
+	@echo "📊 Monitoring stack status:"
+	@$(COMPOSE_CMD_MONITOR) ps --filter "label=com.docker.compose.profiles=monitoring" 2>/dev/null || \
+		$(COMPOSE_CMD_MONITOR) ps | grep -E "(prometheus|grafana|exporter|cadvisor)" || \
+		echo "   No monitoring services running. Start with 'make monitoring-up'"
+
+monitoring-logs:                           ## Show monitoring stack logs
+	$(COMPOSE_CMD_MONITOR) --profile monitoring logs -f --tail=100
+
+monitoring-clean:                          ## Stop and remove all monitoring data (volumes)
+	@echo "📊 Stopping and cleaning monitoring stack..."
+	$(COMPOSE_CMD_MONITOR) --profile monitoring down -v
+	@echo "✅ Monitoring stack stopped and volumes removed."
+
+# =============================================================================
+# help: 🧪 TESTING STACK (Rust fast-test-server)
+# help: testing-up            - Start testing stack (fast_test_server + auto-registration)
+# help: testing-down          - Stop testing stack
+# help: testing-status        - Show status of testing services
+# help: testing-logs          - Show testing stack logs
+
+testing-up:                                ## Start testing stack (fast_test_server + registration)
+	@echo "🧪 Starting testing stack (fast_test_server)..."
+	$(COMPOSE_CMD_MONITOR) --profile testing up -d
+	@echo ""
+	@echo "✅ Testing stack started!"
+	@echo ""
+	@echo "   🦀 Fast Test Server: http://localhost:9080"
+	@echo "      • MCP endpoint:  http://localhost:9080/mcp"
+	@echo "      • REST echo:     http://localhost:9080/api/echo"
+	@echo "      • REST time:     http://localhost:9080/api/time"
+	@echo "      • Health:        http://localhost:9080/health"
+	@echo ""
+	@echo "   📝 Registered as 'fast_test' gateway in MCP Gateway"
+	@echo ""
+	@echo "   Run load test: cd mcp-servers/rust/fast-test-server && make locust-mcp"
+
+testing-down:                              ## Stop testing stack
+	@echo "🧪 Stopping testing stack..."
+	$(COMPOSE_CMD_MONITOR) --profile testing down
+	@echo "✅ Testing stack stopped."
+
+testing-status:                            ## Show status of testing services
+	@echo "🧪 Testing stack status:"
+	@$(COMPOSE_CMD_MONITOR) ps | grep -E "(fast_test)" || \
+		echo "   No testing services running. Start with 'make testing-up'"
+
+testing-logs:                              ## Show testing stack logs
+	$(COMPOSE_CMD_MONITOR) --profile testing logs -f --tail=100
+
+# =============================================================================
+# help: 🤖 A2A DEMO AGENTS (Issue #2002 Authentication Testing)
+# help: demo-a2a-up           - Start all 3 A2A demo agents (basic, bearer, apikey) with auto-registration
+# help: demo-a2a-down         - Stop all A2A demo agents
+# help: demo-a2a-status       - Show status of A2A demo agents
+# help: demo-a2a-basic        - Start only Basic Auth demo agent (port 9001)
+# help: demo-a2a-bearer       - Start only Bearer Token demo agent (port 9002)
+# help: demo-a2a-apikey       - Start only X-API-Key demo agent (port 9003)
+
+# A2A Demo Agent configuration
+DEMO_A2A_BASIC_PORT ?= 9001
+DEMO_A2A_BEARER_PORT ?= 9002
+DEMO_A2A_APIKEY_PORT ?= 9003
+DEMO_A2A_BASIC_PID := /tmp/demo-a2a-basic.pid
+DEMO_A2A_BEARER_PID := /tmp/demo-a2a-bearer.pid
+DEMO_A2A_APIKEY_PID := /tmp/demo-a2a-apikey.pid
+
+.PHONY: demo-a2a-up demo-a2a-down demo-a2a-status demo-a2a-basic demo-a2a-bearer demo-a2a-apikey
+
+demo-a2a-up:                               ## Start all 3 A2A demo agents with auto-registration
+	@echo "🤖 Starting A2A demo agents for authentication testing (Issue #2002)..."
+	@echo ""
+	@# Start Basic Auth agent (PYTHONUNBUFFERED=1 ensures print output is captured immediately)
+	@echo "Starting Basic Auth agent on port $(DEMO_A2A_BASIC_PORT)..."
+	@PYTHONUNBUFFERED=1 uv run python scripts/demo_a2a_agent_auth.py \
+		--auth-type basic --port $(DEMO_A2A_BASIC_PORT) --auto-register > /tmp/demo-a2a-basic.log 2>&1 & echo $$! > $(DEMO_A2A_BASIC_PID)
+	@sleep 1
+	@# Start Bearer Token agent
+	@echo "Starting Bearer Token agent on port $(DEMO_A2A_BEARER_PORT)..."
+	@PYTHONUNBUFFERED=1 uv run python scripts/demo_a2a_agent_auth.py \
+		--auth-type bearer --port $(DEMO_A2A_BEARER_PORT) --auto-register > /tmp/demo-a2a-bearer.log 2>&1 & echo $$! > $(DEMO_A2A_BEARER_PID)
+	@sleep 1
+	@# Start X-API-Key agent
+	@echo "Starting X-API-Key agent on port $(DEMO_A2A_APIKEY_PORT)..."
+	@PYTHONUNBUFFERED=1 uv run python scripts/demo_a2a_agent_auth.py \
+		--auth-type apikey --port $(DEMO_A2A_APIKEY_PORT) --auto-register > /tmp/demo-a2a-apikey.log 2>&1 & echo $$! > $(DEMO_A2A_APIKEY_PID)
+	@sleep 2
+	@echo ""
+	@echo "✅ A2A demo agents started!"
+	@echo ""
+	@echo "   🔐 Basic Auth:    http://localhost:$(DEMO_A2A_BASIC_PORT)  (log: /tmp/demo-a2a-basic.log)"
+	@echo "   🎫 Bearer Token:  http://localhost:$(DEMO_A2A_BEARER_PORT)  (log: /tmp/demo-a2a-bearer.log)"
+	@echo "   🔑 X-API-Key:     http://localhost:$(DEMO_A2A_APIKEY_PORT)  (log: /tmp/demo-a2a-apikey.log)"
+	@echo ""
+	@echo "   View credentials: cat /tmp/demo-a2a-*.log | grep -A5 'Configuration:'"
+	@echo "   Stop agents:      make demo-a2a-down"
+	@echo ""
+
+demo-a2a-down:                             ## Stop all A2A demo agents
+	@echo "🤖 Stopping A2A demo agents..."
+	@# Send SIGTERM first to allow graceful unregistration
+	@-if [ -f $(DEMO_A2A_BASIC_PID) ]; then kill -15 $$(cat $(DEMO_A2A_BASIC_PID)) 2>/dev/null || true; fi
+	@-if [ -f $(DEMO_A2A_BEARER_PID) ]; then kill -15 $$(cat $(DEMO_A2A_BEARER_PID)) 2>/dev/null || true; fi
+	@-if [ -f $(DEMO_A2A_APIKEY_PID) ]; then kill -15 $$(cat $(DEMO_A2A_APIKEY_PID)) 2>/dev/null || true; fi
+	@sleep 2
+	@# Force kill any remaining processes
+	@-if [ -f $(DEMO_A2A_BASIC_PID) ]; then kill -9 $$(cat $(DEMO_A2A_BASIC_PID)) 2>/dev/null || true; rm -f $(DEMO_A2A_BASIC_PID); fi
+	@-if [ -f $(DEMO_A2A_BEARER_PID) ]; then kill -9 $$(cat $(DEMO_A2A_BEARER_PID)) 2>/dev/null || true; rm -f $(DEMO_A2A_BEARER_PID); fi
+	@-if [ -f $(DEMO_A2A_APIKEY_PID) ]; then kill -9 $$(cat $(DEMO_A2A_APIKEY_PID)) 2>/dev/null || true; rm -f $(DEMO_A2A_APIKEY_PID); fi
+	@echo "✅ A2A demo agents stopped."
+
+demo-a2a-status:                           ## Show status of A2A demo agents
+	@echo "🤖 A2A demo agent status:"
+	@echo ""
+	@if [ -f $(DEMO_A2A_BASIC_PID) ] && kill -0 $$(cat $(DEMO_A2A_BASIC_PID)) 2>/dev/null; then \
+		echo "   ✅ Basic Auth (port $(DEMO_A2A_BASIC_PORT)):   running (PID $$(cat $(DEMO_A2A_BASIC_PID)))"; \
+	else \
+		echo "   ❌ Basic Auth (port $(DEMO_A2A_BASIC_PORT)):   stopped"; \
+		rm -f $(DEMO_A2A_BASIC_PID) 2>/dev/null || true; \
+	fi
+	@if [ -f $(DEMO_A2A_BEARER_PID) ] && kill -0 $$(cat $(DEMO_A2A_BEARER_PID)) 2>/dev/null; then \
+		echo "   ✅ Bearer Token (port $(DEMO_A2A_BEARER_PORT)): running (PID $$(cat $(DEMO_A2A_BEARER_PID)))"; \
+	else \
+		echo "   ❌ Bearer Token (port $(DEMO_A2A_BEARER_PORT)): stopped"; \
+		rm -f $(DEMO_A2A_BEARER_PID) 2>/dev/null || true; \
+	fi
+	@if [ -f $(DEMO_A2A_APIKEY_PID) ] && kill -0 $$(cat $(DEMO_A2A_APIKEY_PID)) 2>/dev/null; then \
+		echo "   ✅ X-API-Key (port $(DEMO_A2A_APIKEY_PORT)):    running (PID $$(cat $(DEMO_A2A_APIKEY_PID)))"; \
+	else \
+		echo "   ❌ X-API-Key (port $(DEMO_A2A_APIKEY_PORT)):    stopped"; \
+		rm -f $(DEMO_A2A_APIKEY_PID) 2>/dev/null || true; \
+	fi
+	@echo ""
+
+demo-a2a-basic:                            ## Start only Basic Auth demo agent
+	@echo "🔐 Starting Basic Auth demo agent on port $(DEMO_A2A_BASIC_PORT)..."
+	uv run python scripts/demo_a2a_agent_auth.py --auth-type basic --port $(DEMO_A2A_BASIC_PORT) --auto-register
+
+demo-a2a-bearer:                           ## Start only Bearer Token demo agent
+	@echo "🎫 Starting Bearer Token demo agent on port $(DEMO_A2A_BEARER_PORT)..."
+	uv run python scripts/demo_a2a_agent_auth.py --auth-type bearer --port $(DEMO_A2A_BEARER_PORT) --auto-register
+
+demo-a2a-apikey:                           ## Start only X-API-Key demo agent
+	@echo "🔑 Starting X-API-Key demo agent on port $(DEMO_A2A_APIKEY_PORT)..."
+	uv run python scripts/demo_a2a_agent_auth.py --auth-type apikey --port $(DEMO_A2A_APIKEY_PORT) --auto-register
+
+# =============================================================================
+# help: 🎯 BENCHMARK STACK (Go benchmark-server)
+# help: benchmark-up           - Start benchmark stack (MCP servers + auto-registration)
+# help: benchmark-down         - Stop benchmark stack
+# help: benchmark-clean        - Stop and remove all benchmark data (volumes)
+# help: benchmark-status       - Show status of benchmark services
+# help: benchmark-logs         - Show benchmark stack logs
+# help:
+# help: Environment variables:
+# help:   BENCHMARK_SERVER_COUNT  - Number of MCP servers to spawn (default: 10)
+
+# Benchmark configuration (override via environment)
+BENCHMARK_SERVER_COUNT ?= 10
+BENCHMARK_START_PORT ?= 9000
+
+benchmark-up:                              ## Start benchmark stack (MCP servers + registration)
+	@echo "🎯 Starting benchmark stack ($(BENCHMARK_SERVER_COUNT) MCP servers on ports $(BENCHMARK_START_PORT)-$$(($(BENCHMARK_START_PORT) + $(BENCHMARK_SERVER_COUNT) - 1)))..."
+	BENCHMARK_SERVER_COUNT=$(BENCHMARK_SERVER_COUNT) BENCHMARK_START_PORT=$(BENCHMARK_START_PORT) \
+		$(COMPOSE_CMD_MONITOR) --profile benchmark up -d
+	@echo ""
+	@echo "✅ Benchmark stack started!"
+	@echo ""
+	@echo "   🚀 Benchmark Servers: http://localhost:$(BENCHMARK_START_PORT)-$$(($(BENCHMARK_START_PORT) + $(BENCHMARK_SERVER_COUNT) - 1))"
+	@echo "      • MCP endpoint:  http://localhost:<port>/mcp"
+	@echo "      • Health:        http://localhost:<port>/health"
+	@echo "      • Version:       http://localhost:<port>/version"
+	@echo ""
+	@echo "   📝 Registered as 'benchmark-$(BENCHMARK_START_PORT)' through 'benchmark-$$(($(BENCHMARK_START_PORT) + $(BENCHMARK_SERVER_COUNT) - 1))' gateways"
+	@echo ""
+	@echo "   Run load test: make load-test-ui"
+	@echo ""
+	@echo "   💡 Configure server count: BENCHMARK_SERVER_COUNT=50 make benchmark-up"
+
+benchmark-down:                            ## Stop benchmark stack
+	@echo "🎯 Stopping benchmark stack..."
+	$(COMPOSE_CMD_MONITOR) --profile benchmark down
+	@echo "✅ Benchmark stack stopped."
+
+benchmark-clean:                           ## Stop and remove all benchmark data (volumes)
+	@echo "🎯 Stopping and cleaning benchmark stack..."
+	$(COMPOSE_CMD_MONITOR) --profile benchmark down -v
+	@echo "✅ Benchmark stack stopped and volumes removed."
+
+benchmark-status:                          ## Show status of benchmark services
+	@echo "🎯 Benchmark stack status:"
+	@$(COMPOSE_CMD_MONITOR) ps | grep -E "(benchmark)" || \
+		echo "   No benchmark services running. Start with 'make benchmark-up'"
+
+benchmark-logs:                            ## Show benchmark stack logs
+	$(COMPOSE_CMD_MONITOR) --profile benchmark logs -f --tail=100
+
+# =============================================================================
+# 🚀 PERFORMANCE TESTING STACK - High-capacity configuration
+# =============================================================================
+# help: 🚀 PERFORMANCE TESTING STACK
+# help: performance-up         - Start performance stack (7 gateways, PostgreSQL replica, monitoring)
+# help: performance-down       - Stop performance stack
+# help: performance-clean      - Stop and remove all performance data (volumes)
+# help: performance-logs       - Show performance stack logs
+
+# Compose command for performance testing (uses docker-compose-performance.yml)
+COMPOSE_CMD_PERF := $(shell \
+	if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then \
+		echo "docker compose -f docker-compose-performance.yml"; \
+	elif command -v podman &>/dev/null && podman compose version &>/dev/null 2>&1; then \
+		echo "podman compose -f docker-compose-performance.yml"; \
+	else \
+		echo "docker-compose -f docker-compose-performance.yml"; \
+	fi)
+
+performance-up:                            ## Start performance stack (7 gateways, PostgreSQL replica, monitoring)
+	@echo "🚀 Starting performance testing stack..."
+	@echo "   • 7 gateway replicas"
+	@echo "   • PostgreSQL primary + read replica (streaming replication)"
+	@echo "   • PgBouncer with load balancing"
+	@echo "   • Full monitoring stack"
+	@echo ""
+	$(COMPOSE_CMD_PERF) --profile monitoring --profile replica up -d
+	@echo "⏳ Waiting for Grafana to be ready..."
+	@for i in 1 2 3 4 5 6 7 8 9 10 11 12; do \
+		if curl -s -o /dev/null -w '' http://localhost:3000/api/health 2>/dev/null; then break; fi; \
+		sleep 3; \
+	done
+	@# Configure Grafana: star dashboard and set as home
+	@curl -s -X POST -u admin:changeme 'http://localhost:3000/api/user/stars/dashboard/uid/mcp-gateway-overview' >/dev/null 2>&1 || true
+	@curl -s -X PUT -u admin:changeme -H "Content-Type: application/json" -d '{"homeDashboardUID": "mcp-gateway-overview"}' 'http://localhost:3000/api/org/preferences' >/dev/null 2>&1 || true
+	@curl -s -X PUT -u admin:changeme -H "Content-Type: application/json" -d '{"homeDashboardUID": "mcp-gateway-overview"}' 'http://localhost:3000/api/user/preferences' >/dev/null 2>&1 || true
+	@echo ""
+	@echo "✅ Performance stack started!"
+	@echo ""
+	@echo "   🌐 Grafana:    http://localhost:3000 (admin/changeme)"
+	@echo "   🔥 Prometheus: http://localhost:9090"
+	@echo "   🐘 PostgreSQL: Primary + Read Replica (load balanced via PgBouncer)"
+	@echo ""
+	@echo "   📊 Key Dashboards:"
+	@echo "      • MCP Gateway Overview - main dashboard (set as home)"
+	@echo "      • PostgreSQL Replication - primary/replica stats, lag, distribution"
+	@echo "      • PostgreSQL Database - detailed DB metrics"
+	@echo "      • PgBouncer - connection pool stats"
+	@echo ""
+	@echo "   🏋️ Configuration:"
+	@echo "      • 7 gateway replicas (vs 3 in standard)"
+	@echo "      • PostgreSQL read replica for read scaling"
+	@echo "      • PgBouncer round-robin across primary + replica"
+	@echo ""
+	@echo "   Run load test: make load-test-ui"
+
+performance-down:                          ## Stop performance stack
+	@echo "🚀 Stopping performance stack..."
+	$(COMPOSE_CMD_PERF) --profile monitoring --profile replica down
+	@echo "✅ Performance stack stopped."
+
+performance-logs:                          ## Show performance stack logs
+	$(COMPOSE_CMD_PERF) --profile monitoring --profile replica logs -f --tail=100
+
+performance-clean:                         ## Stop and remove all performance data (volumes)
+	@echo "🚀 Stopping and cleaning performance stack..."
+	$(COMPOSE_CMD_PERF) --profile monitoring --profile replica down -v
+	@echo "✅ Performance stack stopped and volumes removed."
+
+# =============================================================================
+# 🔥 HTTP LOAD TESTING - Locust-based traffic generation
+# =============================================================================
+# help: 🔥 HTTP LOAD TESTING (Locust)
+# help: load-test             - Run HTTP load test (4000 users, 5m, headless)
+# help: load-test-ui          - Start Locust web UI (4000 users, 200 spawn/s)
+# help: load-test-light       - Light load test (10 users, 30s)
+# help: load-test-heavy       - Heavy load test (200 users, 120s)
+# help: load-test-sustained   - Sustained load test (25 users, 300s)
+# help: load-test-stress      - Stress test (500 users, 60s, minimal wait)
+# help: load-test-report      - Show last load test HTML report
+# help: load-test-compose     - Light load test for compose stack (port 4444)
+# help: load-test-timeserver  - Load test fast_time_server (5 users, 30s)
+# help: load-test-fasttime    - Load test fast_time MCP tools (50 users, 60s)
+# help: load-test-1000        - High-load test (1000 users, 120s)
+# help: load-test-summary     - Parse CSV reports and show summary statistics
+
+# Default load test configuration (optimized for 4000+ users)
+LOADTEST_HOST ?= http://localhost:8080
+LOADTEST_USERS ?= 4000
+LOADTEST_SPAWN_RATE ?= 200
+LOADTEST_RUN_TIME ?= 5m
+LOADTEST_PROCESSES ?= -1
+LOADTEST_LOCUSTFILE := tests/loadtest/locustfile.py
+LOADTEST_HTML_REPORT := reports/locust_report.html
+LOADTEST_CSV_PREFIX := reports/locust
+# Auto-detect c-ares resolver availability (empty string if unavailable)
+LOADTEST_GEVENT_RESOLVER := $(shell python3 -c "from gevent.resolver.cares import Resolver; print('ares')" 2>/dev/null || echo "")
+
+load-test:                                 ## Run HTTP load test (4000 users, 5m, headless)
+	@echo "🔥 Running HTTP load test with Locust..."
+	@echo "   Host: $(LOADTEST_HOST)"
+	@echo "   Users: $(LOADTEST_USERS)"
+	@echo "   Spawn rate: $(LOADTEST_SPAWN_RATE)/s"
+	@echo "   Duration: $(LOADTEST_RUN_TIME)"
+	@echo "   Workers: $(LOADTEST_PROCESSES) (-1 = auto-detect CPUs)"
+	@echo ""
+	@# Check ulimits and warn if below threshold
+	@NOFILE=$$(ulimit -n 2>/dev/null || echo 0); \
+	NPROC=$$(ulimit -u 2>/dev/null || echo 0); \
+	if [ "$$NOFILE" -lt 10000 ]; then \
+		echo "   ⚠️  WARNING: ulimit -n ($$NOFILE) is below 10000 - may cause connection failures"; \
+		echo "   💡 Fix: Add to /etc/security/limits.conf and restart shell"; \
+		echo ""; \
+	fi; \
+	if [ "$$NPROC" -lt 10000 ]; then \
+		echo "   ⚠️  WARNING: ulimit -u ($$NPROC) is below 10000 - may limit worker processes"; \
+		echo ""; \
+	fi
+	@echo "   💡 Tip: Start server first with 'make dev' in another terminal"
+	@echo "   💡 Tip: For best results, run: sudo scripts/tune-loadtest.sh"
+	@echo ""
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@mkdir -p reports
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		ulimit -n 65536 2>/dev/null || true && \
+		$(if $(LOADTEST_GEVENT_RESOLVER),GEVENT_RESOLVER=$(LOADTEST_GEVENT_RESOLVER)) \
+		locust -f $(LOADTEST_LOCUSTFILE) \
+			--host=$(LOADTEST_HOST) \
+			--users=$(LOADTEST_USERS) \
+			--spawn-rate=$(LOADTEST_SPAWN_RATE) \
+			--run-time=$(LOADTEST_RUN_TIME) \
+			--processes=$(LOADTEST_PROCESSES) \
+			--headless \
+			--html=$(LOADTEST_HTML_REPORT) \
+			--csv=$(LOADTEST_CSV_PREFIX) \
+			--only-summary"
+	@echo ""
+	@echo "✅ Load test complete!"
+	@echo "📄 HTML Report: $(LOADTEST_HTML_REPORT)"
+	@echo "📊 CSV Reports: $(LOADTEST_CSV_PREFIX)_*.csv"
+
+load-test-ui:                              ## Start Locust web UI at http://localhost:8089
+	@echo "🔥 Starting Locust Web UI (optimized for 4000+ users)..."
+	@echo "   🌐 Open http://localhost:8089 in your browser"
+	@echo "   🎯 Default host: $(LOADTEST_HOST)"
+	@echo "   👥 Default users: $(LOADTEST_USERS), spawn rate: $(LOADTEST_SPAWN_RATE)/s"
+	@echo "   ⏱️  Default run time: $(LOADTEST_RUN_TIME)"
+	@echo "   🚀 Workers: $(LOADTEST_PROCESSES) (-1 = auto-detect CPUs)"
+	@echo ""
+	@# Check ulimits and warn if below threshold
+	@NOFILE=$$(ulimit -n 2>/dev/null || echo 0); \
+	NPROC=$$(ulimit -u 2>/dev/null || echo 0); \
+	if [ "$$NOFILE" -lt 10000 ]; then \
+		echo "   ⚠️  WARNING: ulimit -n ($$NOFILE) is below 10000 - may cause connection failures"; \
+		echo "   💡 Fix: Add to /etc/security/limits.conf and restart shell:"; \
+		echo "      *  soft  nofile  65536"; \
+		echo "      *  hard  nofile  65536"; \
+		echo ""; \
+	fi; \
+	if [ "$$NPROC" -lt 10000 ]; then \
+		echo "   ⚠️  WARNING: ulimit -u ($$NPROC) is below 10000 - may limit worker processes"; \
+		echo ""; \
+	fi
+	@echo "   💡 For best results, run: sudo scripts/tune-loadtest.sh"
+	@echo "   💡 Use 'User classes' dropdown to select FastTimeUser, etc."
+	@echo "   💡 Start benchmark servers first: make benchmark-up"
+	@echo ""
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		ulimit -n 65536 2>/dev/null || true && \
+		$(if $(LOADTEST_GEVENT_RESOLVER),GEVENT_RESOLVER=$(LOADTEST_GEVENT_RESOLVER)) \
+		locust -f $(LOADTEST_LOCUSTFILE) \
+			--host=$(LOADTEST_HOST) \
+			--users=$(LOADTEST_USERS) \
+			--spawn-rate=$(LOADTEST_SPAWN_RATE) \
+			--run-time=$(LOADTEST_RUN_TIME) \
+			--processes=$(LOADTEST_PROCESSES) \
+			--class-picker"
+
+load-test-light:                           ## Light load test (10 users, 30s)
+	@echo "🔥 Running LIGHT load test..."
+	@$(MAKE) load-test LOADTEST_USERS=10 LOADTEST_SPAWN_RATE=2 LOADTEST_RUN_TIME=30s
+
+load-test-heavy:                           ## Heavy load test (200 users, 120s)
+	@echo "🔥 Running HEAVY load test..."
+	@echo "   ⚠️  This will generate significant load on your server"
+	@$(MAKE) load-test LOADTEST_USERS=200 LOADTEST_SPAWN_RATE=20 LOADTEST_RUN_TIME=120s
+
+load-test-sustained:                       ## Sustained load test (25 users, 300s)
+	@echo "🔥 Running SUSTAINED load test (5 minutes)..."
+	@$(MAKE) load-test LOADTEST_USERS=25 LOADTEST_SPAWN_RATE=5 LOADTEST_RUN_TIME=300s
+
+load-test-stress:                          ## Stress test (500 users, 60s)
+	@echo "🔥 Running STRESS test..."
+	@echo "   ⚠️  WARNING: This will generate EXTREME load!"
+	@echo "   ⚠️  Your server may become unresponsive"
+	@echo ""
+	@read -p "Continue with stress test? [y/N] " -n 1 -r; \
+	echo; \
+	if [[ $$REPLY =~ ^[Yy]$$ ]]; then \
+		$(MAKE) load-test LOADTEST_USERS=500 LOADTEST_SPAWN_RATE=50 LOADTEST_RUN_TIME=60s; \
+	else \
+		echo "❌ Cancelled"; \
+	fi
+
+load-test-report:                          ## Show last load test HTML report
+	@if [ -f "$(LOADTEST_HTML_REPORT)" ]; then \
+		echo "📊 Opening load test report: $(LOADTEST_HTML_REPORT)"; \
+		if command -v xdg-open &> /dev/null; then \
+			xdg-open $(LOADTEST_HTML_REPORT); \
+		elif command -v open &> /dev/null; then \
+			open $(LOADTEST_HTML_REPORT); \
+		else \
+			echo "Open $(LOADTEST_HTML_REPORT) in your browser"; \
+		fi; \
+	else \
+		echo "❌ No report found. Run 'make load-test' first."; \
+	fi
+
+load-test-compose:                         ## Light load test for compose stack (10 users, 30s, port 4444)
+	@echo "🐳 Running compose-optimized load test..."
+	@echo "   Host: http://localhost:4444"
+	@echo "   Users: 10, Duration: 30s"
+	@echo "   💡 Requires: make compose-up"
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@mkdir -p reports
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		locust -f $(LOADTEST_LOCUSTFILE) \
+			--host=http://localhost:4444 \
+			--users=10 \
+			--spawn-rate=2 \
+			--run-time=30s \
+			--headless \
+			--html=reports/loadtest_compose.html \
+			--csv=reports/loadtest_compose \
+			--only-summary"
+	@echo "✅ Report: reports/loadtest_compose.html"
+
+load-test-timeserver:                      ## Load test fast_time_server tools (5 users, 30s)
+	@echo "⏰ Running time server load test..."
+	@echo "   Host: http://localhost:4444"
+	@echo "   Users: 5, Duration: 30s"
+	@echo "   💡 Requires: docker compose --profile with-fast-time up -d"
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@mkdir -p reports
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		locust -f $(LOADTEST_LOCUSTFILE) \
+			--host=http://localhost:4444 \
+			--users=5 \
+			--spawn-rate=1 \
+			--run-time=30s \
+			--headless \
+			--html=reports/loadtest_timeserver.html \
+			--csv=reports/loadtest_timeserver \
+			FastTimeUser \
+			--only-summary"
+	@echo "✅ Report: reports/loadtest_timeserver.html"
+
+load-test-fasttime:                        ## Load test fast_time MCP tools (50 users, 60s)
+	@echo "⏰ Running FastTime MCP server load test..."
+	@echo "   Host: http://localhost:4444"
+	@echo "   Users: 50, Duration: 60s"
+	@echo "   💡 Requires: docker compose --profile with-fast-time up -d"
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@mkdir -p reports
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		locust -f $(LOADTEST_LOCUSTFILE) \
+			--host=http://localhost:4444 \
+			--users=50 \
+			--spawn-rate=10 \
+			--run-time=60s \
+			--headless \
+			--html=reports/loadtest_fasttime.html \
+			--csv=reports/loadtest_fasttime \
+			FastTimeUser \
+			--only-summary"
+	@echo "✅ Report: reports/loadtest_fasttime.html"
+
+load-test-1000:                            ## High-load test (1000 users, 120s) - requires tuned compose
+	@echo "🔥 Running HIGH LOAD test (1000 users, ~1000 RPS)..."
+	@echo "   Host: http://localhost:4444"
+	@echo "   Users: 1000, Spawn: 50/s, Duration: 120s"
+	@echo "   ⚠️  Requires tuned compose stack (make compose-down && make compose-up)"
+	@read -p "Continue? [y/N] " -n 1 -r; echo; \
+	if [[ $$REPLY =~ ^[Yy]$$ ]]; then \
+		test -d "$(VENV_DIR)" || $(MAKE) venv; \
+		mkdir -p reports; \
+		/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+			locust -f $(LOADTEST_LOCUSTFILE) \
+				--host=http://localhost:4444 \
+				--users=1000 \
+				--spawn-rate=50 \
+				--run-time=120s \
+				--headless \
+				--html=reports/loadtest_1000.html \
+				--csv=reports/loadtest_1000 \
+				--only-summary"; \
+		echo "✅ Report: reports/loadtest_1000.html"; \
+	else \
+		echo "❌ Cancelled"; \
+	fi
+
+load-test-summary:                         ## Parse CSV reports and show summary statistics
+	@if [ -f "$(LOADTEST_CSV_PREFIX)_stats.csv" ]; then \
+		echo ""; \
+		echo "===================================================================================================="; \
+		echo "LOAD TEST SUMMARY (from $(LOADTEST_CSV_PREFIX)_stats.csv)"; \
+		echo "===================================================================================================="; \
+		echo ""; \
+		python3 -c " \
+import csv; \
+import sys; \
+with open('$(LOADTEST_CSV_PREFIX)_stats.csv') as f: \
+    reader = list(csv.DictReader(f)); \
+    if not reader: \
+        print('No data found'); \
+        sys.exit(0); \
+    agg = [r for r in reader if r.get('Name') == 'Aggregated']; \
+    if agg: \
+        a = agg[0]; \
+        print('OVERALL METRICS'); \
+        print('-' * 100); \
+        print(f\"  Total Requests:     {int(float(a.get('Request Count', 0))):,}\"); \
+        print(f\"  Total Failures:     {int(float(a.get('Failure Count', 0))):,}\"); \
+        print(f\"  Requests/sec:       {float(a.get('Requests/s', 0)):.2f}\"); \
+        print(); \
+        print('  Response Times (ms):'); \
+        print(f\"    Average:          {float(a.get('Average Response Time', 0)):.2f}\"); \
+        print(f\"    Min:              {float(a.get('Min Response Time', 0)):.2f}\"); \
+        print(f\"    Max:              {float(a.get('Max Response Time', 0)):.2f}\"); \
+        print(f\"    Median (p50):     {float(a.get('50%', 0)):.2f}\"); \
+        print(f\"    p90:              {float(a.get('90%', 0)):.2f}\"); \
+        print(f\"    p95:              {float(a.get('95%', 0)):.2f}\"); \
+        print(f\"    p99:              {float(a.get('99%', 0)):.2f}\"); \
+    print(); \
+    print('ENDPOINT BREAKDOWN (Top 15)'); \
+    print('-' * 100); \
+    print(f\"{'Endpoint':<40} {'Reqs':>8} {'Fails':>7} {'Avg':>8} {'Min':>8} {'Max':>8} {'p95':>8}\"); \
+    print('-' * 100); \
+    endpoints = [r for r in reader if r.get('Name') != 'Aggregated'][:15]; \
+    for e in endpoints: \
+        name = e.get('Name', '')[:38] + '..' if len(e.get('Name', '')) > 40 else e.get('Name', ''); \
+        print(f\"{name:<40} {int(float(e.get('Request Count', 0))):>8,} {int(float(e.get('Failure Count', 0))):>7,} {float(e.get('Average Response Time', 0)):>8.1f} {float(e.get('Min Response Time', 0)):>8.1f} {float(e.get('Max Response Time', 0)):>8.1f} {float(e.get('95%', 0)):>8.1f}\"); \
+"; \
+		echo ""; \
+		echo "===================================================================================================="; \
+		echo ""; \
+		echo "📊 Full reports:"; \
+		echo "   HTML: $(LOADTEST_HTML_REPORT)"; \
+		echo "   CSV:  $(LOADTEST_CSV_PREFIX)_stats.csv"; \
+	else \
+		echo "❌ No CSV report found at $(LOADTEST_CSV_PREFIX)_stats.csv"; \
+		echo "   Run 'make load-test' first to generate reports."; \
+	fi
+
+# --- Baseline Load Tests (individual components without gateway) ---
+# help: load-test-baseline     - Baseline test: Fast Time Server REST API (1000 users, 3min)
+# help: load-test-baseline-ui  - Baseline test with Locust Web UI
+# help: load-test-baseline-stress - Baseline stress test (2000 users, 3min)
+
+BASELINE_HOST ?= http://localhost:8888
+
+load-test-baseline:                        ## Baseline test: Fast Time Server REST API (1000 users, 3min)
+	@echo "📊 Running BASELINE load test (Fast Time Server REST API)..."
+	@echo "   Host: $(BASELINE_HOST)"
+	@echo "   Users: 1000, Duration: 3 minutes"
+	@echo "   💡 Requires: docker compose --profile with-fast-time up -d"
+	@echo "   📝 This tests the MCP server directly WITHOUT the gateway"
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c 'source $(VENV_DIR)/bin/activate && \
+		cd tests/loadtest && \
+		locust -f locustfile_baseline.py \
+			--host=$(BASELINE_HOST) \
+			--users=1000 \
+			--spawn-rate=100 \
+			--run-time=180s \
+			--headless \
+			--csv=baseline \
+			--html=baseline_report.html'
+	@echo ""
+	@echo "📊 Baseline report: tests/loadtest/baseline_report.html"
+
+load-test-baseline-ui:                     ## Baseline test with Locust Web UI (class picker enabled)
+	@echo "📊 Starting BASELINE load test Web UI..."
+	@echo "   🌐 Open http://localhost:8089 in your browser"
+	@echo "   🎯 Host: $(BASELINE_HOST)"
+	@echo "   👥 Defaults: 1000 users, 100 spawn/s, 3 min"
+	@echo "   🎛️  Class picker enabled - select which tests to run"
+	@echo "   💡 Requires: docker compose --profile with-fast-time up -d"
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c 'source $(VENV_DIR)/bin/activate && \
+		cd tests/loadtest && \
+		locust -f locustfile_baseline.py \
+			--host=$(BASELINE_HOST) \
+			--users=1000 \
+			--spawn-rate=100 \
+			--run-time=180s \
+			--class-picker'
+
+load-test-baseline-stress:                 ## Baseline stress test (2000 users, 3min)
+	@echo "📊 Running BASELINE STRESS test..."
+	@echo "   Host: $(BASELINE_HOST)"
+	@echo "   Users: 2000, Duration: 3 minutes"
+	@echo "   ⚠️  This will generate high load on the MCP server"
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c 'source $(VENV_DIR)/bin/activate && \
+		cd tests/loadtest && \
+		locust -f locustfile_baseline.py \
+			--host=$(BASELINE_HOST) \
+			--users=2000 \
+			--spawn-rate=200 \
+			--run-time=180s \
+			--headless \
+			--csv=baseline_stress \
+			--html=baseline_stress_report.html'
+
+# --- AgentGateway MCP Server Time Load Test ---
+# help: load-test-agentgateway-mcp-server-time - Load test external MCP server at localhost:3000
+
+AGENTGATEWAY_MCP_HOST ?= http://localhost:3000
+
+load-test-agentgateway-mcp-server-time:    ## Load test external MCP server (localhost-get-system-time)
+	@echo "⏰ Running AgentGateway MCP Server Time load test..."
+	@echo "   🌐 Open http://localhost:8089 in your browser"
+	@echo "   🎯 Host: $(AGENTGATEWAY_MCP_HOST)"
+	@echo "   👥 Defaults: 50 users, 10 spawn/s, 60s"
+	@echo "   🔧 Tool: localhost-get-system-time"
+	@echo "   🎛️  Class picker enabled - select which tests to run"
+	@echo ""
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c 'source $(VENV_DIR)/bin/activate && \
+		cd tests/loadtest && \
+		locust -f locustfile_agentgateway_mcp_server_time.py \
+			--host=$(AGENTGATEWAY_MCP_HOST) \
+			--users=50 \
+			--spawn-rate=10 \
+			--run-time=60s \
+			--class-picker'
+
+# =============================================================================
 # 🧬 MUTATION TESTING
 # =============================================================================
 # help: 🧬 MUTATION TESTING
@@ -681,7 +1489,7 @@ mutmut-install:
 	@echo "📥 Installing mutmut..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q mutmut==3.3.1"
+		uv pip install -q mutmut==3.3.1"
 
 mutmut-run: mutmut-install
 	@echo "🧬 Running mutation testing (sample mode - 20 mutants)..."
@@ -748,7 +1556,7 @@ mutmut-clean:
 .PHONY: pip-licenses scc scc-report
 
 pip-licenses:
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && python3 -m uv pip install pip-licenses"
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install -q pip-licenses"
 	@mkdir -p $(dir $(LICENSES_MD))
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
 		pip-licenses --format=markdown --with-authors --with-urls > $(LICENSES_MD)"
@@ -799,7 +1607,7 @@ docs: images sbom
 	@echo "📚  Generating documentation with handsdown..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q handsdown && \
+		uv pip install -q handsdown && \
 		python3 -m handsdown --external https://github.com/IBM/mcp-context-forge/ \
 		         -o $(DOCS_DIR)/docs \
 		         -n app --name '$(PROJECT_NAME)' --cleanup"
@@ -813,7 +1621,7 @@ images:
 	@mkdir -p $(DOCS_DIR)/docs/design/images
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q code2flow && \
+		uv pip install -q code2flow && \
 		$(VENV_DIR)/bin/code2flow mcpgateway/ --output $(DOCS_DIR)/docs/design/images/code2flow.dot || true"
 	@command -v dot >/dev/null 2>&1 || { \
 		echo "⚠️  Graphviz (dot) not installed - skipping diagram generation"; \
@@ -821,12 +1629,12 @@ images:
 	} && \
 	dot -Tsvg -Gbgcolor=transparent -Gfontname="Arial" -Nfontname="Arial" -Nfontsize=14 -Nfontcolor=black -Nfillcolor=white -Nshape=box -Nstyle="filled,rounded" -Ecolor=gray -Efontname="Arial" -Efontsize=14 -Efontcolor=black $(DOCS_DIR)/docs/design/images/code2flow.dot -o $(DOCS_DIR)/docs/design/images/code2flow.svg || true
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q snakefood3 && \
+		uv pip install -q snakefood3 && \
 		python3 -m snakefood3 . mcpgateway > snakefood.dot"
 	@command -v dot >/dev/null 2>&1 && \
 	dot -Tpng -Gbgcolor=transparent -Gfontname="Arial" -Nfontname="Arial" -Nfontsize=12 -Nfontcolor=black -Nfillcolor=white -Nshape=box -Nstyle="filled,rounded" -Ecolor=gray -Efontname="Arial" -Efontsize=10 -Efontcolor=black snakefood.dot -o $(DOCS_DIR)/docs/design/images/snakefood.png || true
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q pylint && \
+		uv pip install -q pylint && \
 		$(VENV_DIR)/bin/pyreverse --colorized mcpgateway || true"
 	@command -v dot >/dev/null 2>&1 && \
 	dot -Tsvg -Gbgcolor=transparent -Gfontname="Arial" -Nfontname="Arial" -Nfontsize=14 -Nfontcolor=black -Nfillcolor=white -Nshape=box -Nstyle="filled,rounded" -Ecolor=gray -Efontname="Arial" -Efontsize=14 -Efontcolor=black packages.dot -o $(DOCS_DIR)/docs/design/images/packages.svg || true && \
@@ -1070,6 +1878,7 @@ pylint: uv                             ## 🐛  pylint checks
 	@echo "🐛 pylint $(TARGET) (parallel)..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		PYLINTHOME=\"$(CURDIR)/.pylint-cache\" UV_CACHE_DIR=\"$(CURDIR)/.uv-cache\" \
 		uv run --active pylint -j 0 --fail-on E --fail-under 10 $(TARGET)"
 
 markdownlint:					    ## 📖  Markdown linting
@@ -1103,9 +1912,9 @@ mypy:                               ## 🏷️  mypy type-checking
 bandit:                             ## 🛡️  bandit security scan
 	@echo "🛡️ bandit $(TARGET)..."
 	@if [ -d "$(TARGET)" ]; then \
-		$(VENV_DIR)/bin/bandit -r $(TARGET); \
+		$(VENV_DIR)/bin/bandit -c pyproject.toml -r $(TARGET); \
 	else \
-		$(VENV_DIR)/bin/bandit $(TARGET); \
+		$(VENV_DIR)/bin/bandit -c pyproject.toml $(TARGET); \
 	fi
 
 pydocstyle:                         ## 📚  Docstring style
@@ -1164,7 +1973,7 @@ wily:                               ## 📈  Maintainability report
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@git stash --quiet
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q wily && \
+		uv pip install -q wily && \
 		python3 -m wily build -n 10 . > /dev/null || true && \
 		python3 -m wily report . || true"
 	@git stash pop --quiet
@@ -1179,14 +1988,14 @@ depend:                             ## 📦  List dependencies
 	@echo "📦  List dependencies"
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q pdm && \
+		uv pip install -q pdm && \
 		python3 -m pdm list --freeze"
 
 snakeviz:                           ## 🐍  Interactive profile visualiser
 	@echo "🐍  Interactive profile visualiser..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q snakeviz && \
+		uv pip install -q snakeviz && \
 		python3 -m cProfile -o mcp.prof mcpgateway/main.py && \
 		python3 -m snakeviz mcp.prof --server"
 
@@ -1194,7 +2003,7 @@ pstats:                             ## 📊  Static call-graph image
 	@echo "📊  Static call-graph image"
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q gprof2dot && \
+		uv pip install -q gprof2dot && \
 		python3 -m cProfile -o mcp.pstats mcpgateway/main.py && \
 		$(VENV_DIR)/bin/gprof2dot -w -e 3 -n 3 -s -f pstats mcp.pstats | \
 		dot -Tpng -o $(DOCS_DIR)/pstats.png"
@@ -1206,15 +2015,15 @@ tox:                                ## 🧪  Multi-Python tox matrix (uv)
 	@echo "🧪  Running tox with uv across Python 3.11, 3.12, 3.13..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q tox tox-uv && \
+		uv pip install -q tox tox-uv && \
 		python3 -m tox -p auto $(TOXARGS)"
 
-sbom:								## 🛡️  Generate SBOM & security report
+sbom: uv							## 🛡️  Generate SBOM & security report
 	@echo "🛡️   Generating SBOM & security report..."
 	@rm -Rf "$(VENV_DIR).sbom"
-	@python3 -m venv "$(VENV_DIR).sbom"
-	@/bin/bash -c "source $(VENV_DIR).sbom/bin/activate && python3 -m pip install --upgrade pip setuptools pdm uv && python3 -m uv pip install .[dev]"
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && python3 -m uv pip install cyclonedx-bom sbom2doc"
+	@uv venv "$(VENV_DIR).sbom"
+	@/bin/bash -c "source $(VENV_DIR).sbom/bin/activate && uv pip install .[dev]"
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install -q cyclonedx-bom sbom2doc"
 	@echo "🔍  Generating SBOM from environment..."
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
 		python3 -m cyclonedx_py environment \
@@ -1354,7 +2163,7 @@ install-watchdog:						## 📦 Install watchdog for file watching
 	@echo "📦 Installing watchdog for file watching..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q watchdog"
+		uv pip install -q watchdog"
 
 # Watch mode - lint on file changes
 lint-watch: install-watchdog			## 👁️ Watch for changes and auto-lint
@@ -1581,7 +2390,7 @@ lint-parallel:							## 🚀 Run linters in parallel
 	@echo "🚀 Running linters in parallel on $(TARGET)..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q pytest-xdist"
+		uv pip install -q pytest-xdist"
 	@# Run fast linters in parallel
 	@$(MAKE) --no-print-directory ruff-check TARGET="$(TARGET)" & \
 	$(MAKE) --no-print-directory black-check TARGET="$(TARGET)" & \
@@ -1626,7 +2435,7 @@ lint-complexity:						## 📈 Analyze code complexity
 	@echo "📈 Analyzing code complexity for $(TARGET)..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q radon && \
+		uv pip install -q radon && \
 		echo '📊 Cyclomatic Complexity:' && \
 		$(VENV_DIR)/bin/radon cc $(TARGET) -s && \
 		echo '' && \
@@ -1689,7 +2498,7 @@ yamllint:                         ## 📑 YAML linting
 	$(call ensure_pip_package,yamllint)
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q yamllint 2>/dev/null || true"
+		uv pip install -q yamllint 2>/dev/null || true"
 	@$(VENV_DIR)/bin/yamllint -c .yamllint .
 
 jsonlint:                         ## 📑 JSON validation (jq)
@@ -1709,7 +2518,7 @@ tomllint:                         ## 📑 TOML validation (tomlcheck)
 	@echo '📑  tomllint (tomlcheck) ...'
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q tomlcheck 2>/dev/null || true"
+		uv pip install -q tomlcheck 2>/dev/null || true"
 	@find . -type f -name '*.toml' -print0 \
 	  | xargs -0 -I{} $(VENV_DIR)/bin/tomlcheck "{}"
 
@@ -1717,44 +2526,29 @@ tomllint:                         ## 📑 TOML validation (tomlcheck)
 # 🕸️  WEBPAGE LINTERS & STATIC ANALYSIS
 # =============================================================================
 # help: 🕸️  WEBPAGE LINTERS & STATIC ANALYSIS (HTML/CSS/JS lint + security scans + formatting)
-# help: install-web-linters  - Install HTMLHint, Stylelint, ESLint, Retire.js, Prettier, JSHint, jscpd & markuplint via npm
 # help: nodejsscan           - Run nodejsscan for JS security vulnerabilities
 # help: lint-web             - Run HTMLHint, Stylelint, ESLint, Retire.js, nodejsscan and npm audit
+# help: eslint               - Run ESLint for JavaScript standard style and prettifying
 # help: jshint               - Run JSHint for additional JavaScript analysis
 # help: jscpd                - Detect copy-pasted code in JS/HTML/CSS files
 # help: markuplint           - Modern HTML linting with markuplint
 # help: format-web           - Format HTML, CSS & JS files with Prettier
-.PHONY: install-web-linters nodejsscan lint-web jshint jscpd markuplint format-web
-
-install-web-linters:
-	@echo "🔧 Installing HTML/CSS/JS lint, security & formatting tools..."
-	@if [ ! -f package.json ]; then \
-	  echo "📦 Initializing npm project..."; \
-	  npm init -y >/dev/null; \
-	fi
-	@npm install --no-save \
-		htmlhint \
-		stylelint stylelint-config-standard @stylistic/stylelint-config stylelint-order \
-		eslint eslint-config-standard eslint-plugin-import eslint-plugin-n eslint-plugin-promise \
-		eslint-plugin-prettier eslint-config-prettier \
-		retire \
-		prettier \
-		jshint \
-		jscpd \
-		markuplint
+.PHONY: nodejsscan eslint lint-web jshint jscpd markuplint format-web
 
 nodejsscan:
 	@echo "🔒 Running nodejsscan for JavaScript security vulnerabilities..."
-	$(call ensure_pip_package,nodejsscan)
-	@$(VENV_DIR)/bin/nodejsscan --directory ./mcpgateway/static --directory ./mcpgateway/templates || true
+	@uvx nodejsscan --directory ./mcpgateway/static --directory ./mcpgateway/templates || true
 
-lint-web: install-web-linters nodejsscan
+eslint:
+	@echo "🔍 Linting JS files..."
+	@npm install --no-save
+	@find mcpgateway/static -name "*.js" -print0 | { xargs -0 npx eslint || true; }
+
+lint-web: eslint nodejsscan
 	@echo "🔍 Linting HTML files..."
 	@find mcpgateway/templates -name "*.html" -exec npx htmlhint {} + 2>/dev/null || true
 	@echo "🔍 Linting CSS files..."
 	@find mcpgateway/static -name "*.css" -exec npx stylelint {} + 2>/dev/null || true
-	@echo "🔍 Linting JS files..."
-	@find mcpgateway/static -name "*.js" -exec npx eslint {} + 2>/dev/null || true
 	@echo "🔒 Scanning for known JS/CSS library vulnerabilities with retire.js..."
 	@cd mcpgateway/static && npx retire . 2>/dev/null || true
 	@if [ -f package.json ]; then \
@@ -1764,27 +2558,27 @@ lint-web: install-web-linters nodejsscan
 	  echo "⚠️  Skipping npm audit: no package.json found"; \
 	fi
 
-jshint: install-web-linters
+jshint:
 	@echo "🔍 Running JSHint for JavaScript analysis..."
 	@if [ -f .jshintrc ]; then \
 	  echo "📋 Using .jshintrc configuration"; \
-	  npx jshint --config .jshintrc mcpgateway/static/*.js || true; \
+	  npx --yes jshint --config .jshintrc mcpgateway/static/*.js || true; \
 	else \
 	  echo "📋 No .jshintrc found, using defaults with ES11"; \
-	  npx jshint --esversion=11 mcpgateway/static/*.js || true; \
+	  npx --yes jshint --esversion=11 mcpgateway/static/*.js || true; \
 	fi
 
-jscpd: install-web-linters
+jscpd:
 	@echo "🔍 Detecting copy-pasted code with jscpd..."
-	@npx jscpd "mcpgateway/static/" "mcpgateway/templates/" || true
+	@npx --yes jscpd "mcpgateway/static/" "mcpgateway/templates/" || true
 
-markuplint: install-web-linters
+markuplint:
 	@echo "🔍 Running markuplint for modern HTML validation..."
-	@npx markuplint mcpgateway/templates/* || true
+	@npx --yes markuplint mcpgateway/templates/* || true
 
-format-web: install-web-linters
+format-web:
 	@echo "🎨 Formatting HTML, CSS & JS with Prettier..."
-	@npx prettier --write "mcpgateway/templates/**/*.html" \
+	@npx --yes prettier --write "mcpgateway/templates/**/*.html" \
 	                 "mcpgateway/static/**/*.css" \
 	                 "mcpgateway/static/**/*.js"
 
@@ -1869,14 +2663,14 @@ PROJECT_BASEDIR     ?= $(strip $(PWD))
 # ─────────────────────────────────────────────────────────────────────────
 
 ## ─────────── Dependencies (compose + misc) ─────────────────────────────
-sonar-deps-podman:
+sonar-deps-podman: uv
 	@echo "🔧 Installing podman-compose ..."
-	python3 -m pip install --quiet podman-compose
+	uv tool install --quiet podman-compose
 
-sonar-deps-docker:
+sonar-deps-docker: uv
 	@echo "🔧 Ensuring $(COMPOSE_CMD) is available ..."
 	@command -v $(firstword $(COMPOSE_CMD)) >/dev/null || \
-	  python3 -m pip install --quiet docker-compose
+	  uv tool install --quiet docker-compose
 
 ## ─────────── Run SonarQube server (compose) ────────────────────────────
 sonar-up-podman:
@@ -1913,11 +2707,10 @@ sonar-submit-podman:
 		-Dproject.settings=$(SONAR_PROPS)
 
 ## ─────────── Python wrapper (pysonar-scanner) ───────────────────────────
-pysonar-scanner:
+pysonar-scanner: uv
 	@echo "🐍 Scanning code with pysonar-scanner (PyPI) ..."
 	@test -f $(SONAR_PROPS) || { echo "❌ $(SONAR_PROPS) not found."; exit 1; }
-	python3 -m pip install --upgrade --quiet pysonar-scanner
-	python3 -m pysonar_scanner \
+	uvx pysonar-scanner \
 		-Dproject.settings=$(SONAR_PROPS) \
 		-Dsonar.host.url=$(SONAR_HOST_URL) \
 		$(if $(SONAR_TOKEN),-Dsonar.login=$(SONAR_TOKEN),)
@@ -2063,13 +2856,9 @@ containerfile-update:
 # =============================================================================
 .PHONY: dist wheel sdist verify publish publish-testpypi
 
-dist: clean                  ## Build wheel + sdist into ./dist (optionally includes Rust plugins)
-	@test -d "$(VENV_DIR)" || $(MAKE) --no-print-directory venv
+dist: clean uv               ## Build wheel + sdist into ./dist (optionally includes Rust plugins)
 	@echo "📦 Building Python package..."
-	@/bin/bash -eu -c "\
-	    source $(VENV_DIR)/bin/activate && \
-	    python3 -m pip install --quiet --upgrade pip build && \
-	    python3 -m build"
+	@uv build
 	@if [ "$(ENABLE_RUST_BUILD)" = "1" ]; then \
 		echo "🦀 Building Rust plugins..."; \
 		$(MAKE) rust-build || { echo "⚠️  Rust build failed, continuing without Rust plugins"; exit 0; }; \
@@ -2083,13 +2872,9 @@ dist: clean                  ## Build wheel + sdist into ./dist (optionally incl
 	@echo '   make publish         # Publish Python package'
 	@echo '   make rust-publish    # Publish Rust wheels (if configured)'
 
-wheel:                       ## Build wheel only (Python + optionally Rust)
-	@test -d "$(VENV_DIR)" || $(MAKE) --no-print-directory venv
+wheel: uv                    ## Build wheel only (Python + optionally Rust)
 	@echo "📦 Building Python wheel..."
-	@/bin/bash -eu -c "\
-	    source $(VENV_DIR)/bin/activate && \
-	    python3 -m pip install --quiet --upgrade pip build && \
-	    python3 -m build -w"
+	@uv build --wheel
 	@if [ "$(ENABLE_RUST_BUILD)" = "1" ]; then \
 		echo "🦀 Building Rust wheels..."; \
 		$(MAKE) rust-build || { echo "⚠️  Rust build failed, continuing without Rust plugins"; exit 0; }; \
@@ -2099,27 +2884,21 @@ wheel:                       ## Build wheel only (Python + optionally Rust)
 	fi
 	@echo '🛠  Python wheel written to ./dist'
 
-sdist:                       ## Build source distribution only
-	@test -d "$(VENV_DIR)" || $(MAKE) --no-print-directory venv
-	@/bin/bash -eu -c "\
-	    source $(VENV_DIR)/bin/activate && \
-	    python3 -m pip install --quiet --upgrade pip build && \
-	    python3 -m build -s"
+sdist: uv                    ## Build source distribution only
+	@echo "📦 Building source distribution..."
+	@uv build --sdist
 	@echo '🛠  Source distribution written to ./dist'
 
-verify: dist               ## Build, run metadata & manifest checks
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-	twine check dist/* && \
-	check-manifest && \
-	pyroma -d ."
+verify: dist uv            ## Build, run metadata & manifest checks
+	@uvx twine check dist/* && uvx check-manifest && uvx pyroma -d .
 	@echo "✅  Package verified - ready to publish."
 
-publish: verify            ## Verify, then upload to PyPI
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && twine upload dist/*"
+publish: verify uv         ## Verify, then upload to PyPI
+	@uvx twine upload dist/*
 	@echo "🚀  Upload finished - check https://pypi.org/project/$(PROJECT_NAME)/"
 
-publish-testpypi: verify   ## Verify, then upload to TestPyPI
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && twine upload --repository testpypi dist/*"
+publish-testpypi: verify uv ## Verify, then upload to TestPyPI
+	@uvx twine upload --repository testpypi dist/*
 	@echo "🚀  Upload finished - check https://test.pypi.org/project/$(PROJECT_NAME)/"
 
 # Allow override via environment
@@ -2386,6 +3165,85 @@ container-run-ssl-jwt: certs certs-jwt container-check-image
 	@echo "🔐 JWT Algorithm: RS256"
 	@echo "📁 Keys mounted: /app/certs/jwt/{private,public}.pem"
 
+# HTTP Server selection targets
+container-run-granian: container-check-image  ## Run container with Granian (Rust-based HTTP server)
+	@echo "🚀 Running with $(CONTAINER_RUNTIME) + Granian..."
+	-$(CONTAINER_RUNTIME) stop $(PROJECT_NAME) 2>/dev/null || true
+	-$(CONTAINER_RUNTIME) rm $(PROJECT_NAME) 2>/dev/null || true
+	$(CONTAINER_RUNTIME) run --name $(PROJECT_NAME) \
+		--env-file=.env \
+		-e HTTP_SERVER=granian \
+		-p 4444:4444 \
+		--restart=always \
+		--memory=$(CONTAINER_MEMORY) --cpus=$(CONTAINER_CPUS) \
+		--health-cmd="curl --fail http://localhost:4444/health || exit 1" \
+		--health-interval=1m --health-retries=3 \
+		--health-start-period=30s --health-timeout=10s \
+		-d $(call get_image_name)
+	@sleep 2
+	@echo "✅ Container started with Granian"
+
+container-run-gunicorn: container-check-image  ## Run container with Gunicorn + Uvicorn
+	@echo "🚀 Running with $(CONTAINER_RUNTIME) + Gunicorn..."
+	-$(CONTAINER_RUNTIME) stop $(PROJECT_NAME) 2>/dev/null || true
+	-$(CONTAINER_RUNTIME) rm $(PROJECT_NAME) 2>/dev/null || true
+	$(CONTAINER_RUNTIME) run --name $(PROJECT_NAME) \
+		--env-file=.env \
+		-e HTTP_SERVER=gunicorn \
+		-p 4444:4444 \
+		--restart=always \
+		--memory=$(CONTAINER_MEMORY) --cpus=$(CONTAINER_CPUS) \
+		--health-cmd="curl --fail http://localhost:4444/health || exit 1" \
+		--health-interval=1m --health-retries=3 \
+		--health-start-period=30s --health-timeout=10s \
+		-d $(call get_image_name)
+	@sleep 2
+	@echo "✅ Container started with Gunicorn"
+
+container-run-granian-ssl: certs container-check-image  ## Run container with Granian + TLS
+	@echo "🚀 Running with $(CONTAINER_RUNTIME) + Granian (TLS)..."
+	-$(CONTAINER_RUNTIME) stop $(PROJECT_NAME) 2>/dev/null || true
+	-$(CONTAINER_RUNTIME) rm $(PROJECT_NAME) 2>/dev/null || true
+	$(CONTAINER_RUNTIME) run --name $(PROJECT_NAME) \
+		--user $(shell id -u):$(shell id -g) \
+		--env-file=.env \
+		-e HTTP_SERVER=granian \
+		-e SSL=true \
+		-e CERT_FILE=certs/cert.pem \
+		-e KEY_FILE=certs/key.pem \
+		-v $(PWD)/certs:/app/certs:ro$(if $(filter podman,$(CONTAINER_RUNTIME)),$(COMMA)Z,) \
+		-p 4444:4444 \
+		--restart=always \
+		--memory=$(CONTAINER_MEMORY) --cpus=$(CONTAINER_CPUS) \
+		--health-cmd="curl -k --fail https://localhost:4444/health || exit 1" \
+		--health-interval=1m --health-retries=3 \
+		--health-start-period=30s --health-timeout=10s \
+		-d $(call get_image_name)
+	@sleep 2
+	@echo "✅ Container started with Granian + TLS"
+
+container-run-gunicorn-ssl: certs container-check-image  ## Run container with Gunicorn + TLS
+	@echo "🚀 Running with $(CONTAINER_RUNTIME) + Gunicorn (TLS)..."
+	-$(CONTAINER_RUNTIME) stop $(PROJECT_NAME) 2>/dev/null || true
+	-$(CONTAINER_RUNTIME) rm $(PROJECT_NAME) 2>/dev/null || true
+	$(CONTAINER_RUNTIME) run --name $(PROJECT_NAME) \
+		--user $(shell id -u):$(shell id -g) \
+		--env-file=.env \
+		-e HTTP_SERVER=gunicorn \
+		-e SSL=true \
+		-e CERT_FILE=certs/cert.pem \
+		-e KEY_FILE=certs/key.pem \
+		-v $(PWD)/certs:/app/certs:ro$(if $(filter podman,$(CONTAINER_RUNTIME)),$(COMMA)Z,) \
+		-p 4444:4444 \
+		--restart=always \
+		--memory=$(CONTAINER_MEMORY) --cpus=$(CONTAINER_CPUS) \
+		--health-cmd="curl -k --fail https://localhost:4444/health || exit 1" \
+		--health-interval=1m --health-retries=3 \
+		--health-start-period=30s --health-timeout=10s \
+		-d $(call get_image_name)
+	@sleep 2
+	@echo "✅ Container started with Gunicorn + TLS"
+
 container-push: container-check-image
 	@echo "📤 Preparing to push image..."
 	@# For Podman, we need to remove localhost/ prefix for push
@@ -2590,6 +3448,7 @@ container-dev: container-check-image container-validate
 		--env-file=.env \
 		-e DEBUG=true \
 		-e LOG_LEVEL=DEBUG \
+		-e TEMPLATES_AUTO_RELOAD=true \
 		-v $(PWD)/mcpgateway:/app/mcpgateway:ro$(if $(filter podman,$(CONTAINER_RUNTIME)),$(COMMA)Z,) \
 		-p 8000:8000 \
 		--memory=$(CONTAINER_MEMORY) --cpus=$(CONTAINER_CPUS) \
@@ -3426,7 +4285,7 @@ LOCAL_PYPI_AUTH := $(LOCAL_PYPI_DIR)/.htpasswd
 
 local-pypi-install:
 	@echo "📦  Installing pypiserver..."
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && pip install 'pypiserver>=2.3.0' passlib"
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install 'pypiserver>=2.3.0' passlib"
 	@mkdir -p $(LOCAL_PYPI_DIR)
 
 local-pypi-start: local-pypi-install local-pypi-stop
@@ -3507,15 +4366,15 @@ local-pypi-upload-auth:
 local-pypi-test:
 	@echo "📥  Installing from local PyPI..."
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-	pip install --index-url $(LOCAL_PYPI_URL)/simple/ \
+	uv pip install --index-url $(LOCAL_PYPI_URL)/simple/ \
 	            --extra-index-url https://pypi.org/simple/ \
-	            --force-reinstall $(PROJECT_NAME)"
+	            --reinstall $(PROJECT_NAME)"
 	@echo "✅  Installed from local PyPI"
 
 local-pypi-clean: clean dist local-pypi-start-auth local-pypi-upload-auth local-pypi-test
 	@echo "🎉  Full local PyPI cycle complete!"
 	@echo "📊  Package info:"
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && pip show $(PROJECT_NAME)"
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip show $(PROJECT_NAME)"
 
 # Convenience target to restart server
 local-pypi-restart: local-pypi-stop local-pypi-start
@@ -3577,7 +4436,7 @@ DEVPI_PID := /tmp/devpi-server.pid
 devpi-install:
 	@echo "📦  Installing devpi server and client..."
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-	pip install devpi-server devpi-client devpi-web"
+	uv pip install devpi-server devpi-client devpi-web"
 	@echo "✅  DevPi installed"
 
 devpi-init: devpi-install
@@ -3683,15 +4542,15 @@ devpi-test:
 		exit 1; \
 	fi
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-	pip install --index-url $(DEVPI_URL)/$(DEVPI_INDEX)/+simple/ \
+	uv pip install --index-url $(DEVPI_URL)/$(DEVPI_INDEX)/+simple/ \
 	            --extra-index-url https://pypi.org/simple/ \
-	            --force-reinstall mcp-contextforge-gateway"
+	            --reinstall mcp-contextforge-gateway"
 	@echo "✅  Installed mcp-contextforge-gateway from devpi"
 
 devpi-clean: clean dist devpi-upload devpi-test
 	@echo "🎉  Full devpi cycle complete!"
 	@echo "📊  Package info:"
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && pip show mcp-contextforge-gateway"
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip show mcp-contextforge-gateway"
 
 devpi-status:
 	@echo "🔍  DevPi server status:"
@@ -3857,7 +4716,7 @@ shell-linters-install:     ## 🔧  Install shellcheck, shfmt, bashate
 	if ! $(VENV_DIR)/bin/bashate -h >/dev/null 2>&1 ; then \
 	  echo "🛠  Installing bashate (into venv)..." ; \
 	  test -d "$(VENV_DIR)" || $(MAKE) venv ; \
-	  /bin/bash -c "source $(VENV_DIR)/bin/activate && python3 -m pip install --quiet bashate" ; \
+	  /bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install -q bashate" ; \
 	fi
 	@echo "✅  Shell linters ready."
 
@@ -3924,7 +4783,7 @@ ALEMBIC_CONFIG = mcpgateway/alembic.ini
 
 alembic-install:
 	@echo "➜ Installing Alembic ..."
-	pip install --quiet alembic sqlalchemy
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install -q alembic sqlalchemy"
 
 .PHONY: db-init
 db-init: ## Initialize alembic migrations
@@ -4040,7 +4899,7 @@ playwright-install:
 	@echo "🎭 Installing Playwright browsers (chromium)..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		pip install -e '.[playwright]' 2>/dev/null || pip install playwright pytest-playwright && \
+		uv pip install -e '.[playwright]' 2>/dev/null || uv pip install playwright pytest-playwright && \
 		playwright install chromium"
 	@echo "✅ Playwright chromium browser installed!"
 
@@ -4048,7 +4907,7 @@ playwright-install-all:
 	@echo "🎭 Installing all Playwright browsers..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		pip install -e '.[playwright]' 2>/dev/null || pip install playwright pytest-playwright && \
+		uv pip install -e '.[playwright]' 2>/dev/null || uv pip install playwright pytest-playwright && \
 		playwright install"
 	@echo "✅ All Playwright browsers installed!"
 
@@ -4105,7 +4964,7 @@ test-ui-parallel: playwright-install
 	@echo "🎭 Running UI tests in parallel..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		pip install -q pytest-xdist && \
+		uv pip install -q pytest-xdist && \
 		pytest $(PLAYWRIGHT_DIR)/ -v -n auto --dist loadscope \
 		--browser chromium || { echo '❌ UI tests failed!'; exit 1; }"
 	@echo "✅ UI parallel tests completed!"
@@ -4116,7 +4975,7 @@ test-ui-report: playwright-install
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@mkdir -p $(PLAYWRIGHT_REPORTS)
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		pip install -q pytest-html && \
+		uv pip install -q pytest-html && \
 		pytest $(PLAYWRIGHT_DIR)/ -v --screenshot=only-on-failure \
 		--html=$(PLAYWRIGHT_REPORTS)/report.html --self-contained-html \
 		--browser chromium || true"
@@ -4226,43 +5085,42 @@ dodgy:                              ## 🔐 Suspicious code patterns
 	@echo "🔐  dodgy - scanning for hardcoded secrets..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q dodgy && \
+		uv pip install -q dodgy && \
 		$(VENV_DIR)/bin/dodgy $(TARGET) || true"
 
 dlint:                              ## 📏 Python best practices
 	@echo "📏  dlint - checking Python best practices..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q dlint && \
+		uv pip install -q dlint && \
 		$(VENV_DIR)/bin/python -m flake8 --select=DUO mcpgateway"
 
 pyupgrade:                          ## ⬆️  Upgrade Python syntax
 	@echo "⬆️  pyupgrade - checking for syntax upgrade opportunities..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q pyupgrade && \
+		uv pip install -q pyupgrade && \
 		find $(TARGET) -name '*.py' -exec $(VENV_DIR)/bin/pyupgrade --py312-plus --diff {} + || true"
 	@echo "💡  To apply changes, run: find $(TARGET) -name '*.py' -exec $(VENV_DIR)/bin/pyupgrade --py312-plus {} +"
 
-interrogate:                        ## 📝 Docstring coverage
+interrogate: uv                     ## 📝 Docstring coverage
 	@echo "📝  interrogate - checking docstring coverage..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q interrogate && \
-		$(VENV_DIR)/bin/interrogate -vv mcpgateway || true"
+		uv run --active interrogate -vv mcpgateway || true"
 
 prospector:                         ## 🔬 Comprehensive code analysis
 	@echo "🔬  prospector - running comprehensive analysis..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q prospector[with_everything] && \
+		uv pip install -q prospector[with_everything] && \
 		$(VENV_DIR)/bin/prospector mcpgateway || true"
 
 pip-audit:                          ## 🔒 Audit Python dependencies for CVEs
 	@echo "🔒  pip-audit vulnerability scan..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install --quiet --upgrade pip-audit && \
+		uv pip install -q pip-audit && \
 		pip-audit --strict || true"
 
 
@@ -4466,12 +5324,12 @@ security-report:                    ## 📊 Generate comprehensive security repo
 	@echo "" >> $(DOCS_DIR)/docs/security/report.md
 	@echo "## Code Security Patterns (semgrep)" >> $(DOCS_DIR)/docs/security/report.md
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q semgrep && \
+		uv pip install -q semgrep && \
 		$(VENV_DIR)/bin/semgrep --config=auto $(TARGET) --quiet || true" >> $(DOCS_DIR)/docs/security/report.md 2>&1
 	@echo "" >> $(DOCS_DIR)/docs/security/report.md
 	@echo "## Suspicious Code Patterns (dodgy)" >> $(DOCS_DIR)/docs/security/report.md
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q dodgy && \
+		uv pip install -q dodgy && \
 		$(VENV_DIR)/bin/dodgy $(TARGET) || true" >> $(DOCS_DIR)/docs/security/report.md 2>&1
 	@echo "" >> $(DOCS_DIR)/docs/security/report.md
 	@echo "## DevSkim Security Anti-patterns" >> $(DOCS_DIR)/docs/security/report.md
@@ -4487,12 +5345,11 @@ security-fix:                       ## 🔧 Auto-fix security issues where possi
 	@echo "🔧 Attempting to auto-fix security issues..."
 	@echo "➤ Upgrading Python syntax with pyupgrade..."
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install -q pyupgrade && \
+		uv pip install -q pyupgrade && \
 		find $(TARGET) -name '*.py' -exec $(VENV_DIR)/bin/pyupgrade --py312-plus {} +"
 	@echo "➤ Updating dependencies to latest secure versions..."
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		python3 -m pip install --upgrade pip setuptools && \
-		python3 -m pip list --outdated"
+		uv pip list --outdated"
 	@echo "✅ Auto-fixes applied where possible"
 	@echo "⚠️  Manual review still required for:"
 	@echo "   - Dependency updates (run 'make update')"
@@ -4872,7 +5729,7 @@ fuzz-install:                       ## 🔧 Install all fuzzing dependencies
 	@echo "🔧 Installing fuzzing dependencies..."
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
-		pip install -e .[fuzz]"
+		uv pip install -e .[fuzz]"
 	@echo "✅ Fuzzing tools installed"
 
 fuzz-hypothesis: fuzz-install         ## 🧪 Run Hypothesis property-based tests
@@ -5172,12 +6029,12 @@ rust-verify:                            ## Verify Rust plugin installation
 rust-check-maturin:                     ## Check/install maturin
 	@which maturin > /dev/null 2>&1 || { \
 		echo "📦 Installing maturin..."; \
-		/bin/bash -c "source $(VENV_DIR)/bin/activate && pip install maturin"; \
+		/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install maturin"; \
 	}
 
 rust-install-deps:                      ## Install all Rust build dependencies
 	@echo "📦 Installing Rust build dependencies..."
-	@/bin/bash -c "source $(VENV_DIR)/bin/activate && pip install maturin"
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && uv pip install maturin"
 	@rustup --version > /dev/null 2>&1 || { \
 		echo "❌ Rust not installed. Install with:"; \
 		echo "   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"; \

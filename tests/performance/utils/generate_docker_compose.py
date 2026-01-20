@@ -31,6 +31,8 @@ services:
     command:
       - "postgres"
 {postgres_config_commands}
+    networks:
+      - mcpnet
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -41,20 +43,32 @@ services:
 
 {gateway_services}
 
+{fast_time_server}
+
+{fast_test_server}
+
+{benchmark_servers}
+
 {load_balancer}
 
 volumes:
   postgres_data:
 {redis_volume}
+
+networks:
+  mcpnet:
+    driver: bridge
 """
 
 GATEWAY_SERVICE_TEMPLATE = """  gateway{instance_suffix}:
     build:
-      context: ../..
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: Containerfile.lite
     container_name: gateway{instance_suffix}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/mcpgateway
+      - DATABASE_URL=postgresql+psycopg://postgres:postgres@postgres:5432/mcpgateway
 {redis_url}
       - HOST=0.0.0.0
       - PORT=4444
@@ -71,6 +85,8 @@ GATEWAY_SERVICE_TEMPLATE = """  gateway{instance_suffix}:
       - MCPGATEWAY_UI_ENABLED=true
     ports:
       - "{port_mapping}:4444"
+    networks:
+      - mcpnet
     depends_on:
       postgres:
         condition: service_healthy
@@ -87,6 +103,8 @@ REDIS_SERVICE = """  redis:
     container_name: redis_perf
     ports:
       - "6379:6379"
+    networks:
+      - mcpnet
     command: redis-server{redis_config}
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -95,11 +113,74 @@ REDIS_SERVICE = """  redis:
       retries: 5
 """
 
+FAST_TIME_SERVER_TEMPLATE = """  fast_time_server:
+    build:
+      context: ./mcp-servers/go/fast-time-server
+      dockerfile: Dockerfile
+    container_name: fast_time_server
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["-transport=sse", "-port=8002"]
+    ports:
+      - "8002:8002"
+    networks:
+      - mcpnet
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8002/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+"""
+
+FAST_TEST_SERVER_TEMPLATE = """  fast_test_server:
+    build:
+      context: ./mcp-servers/rust/fast-test-server
+      dockerfile: Dockerfile
+    container_name: fast_test_server
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - BIND_ADDRESS=0.0.0.0:8880
+      - RUST_LOG=info
+    ports:
+      - "8880:8880"
+    networks:
+      - mcpnet
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8880/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+"""
+
+BENCHMARK_SERVER_TEMPLATE = """  benchmark_server:
+    build:
+      context: ./mcp-servers/go/benchmark-server
+      dockerfile: Dockerfile
+    container_name: benchmark_server
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["-transport=http", "-server-count={server_count}", "-start-port={start_port}", "-tools={tools_per_server}", "-resources={resources_per_server}", "-prompts={prompts_per_server}"]
+    ports:
+      - "{port_range}"
+    networks:
+      - mcpnet
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:{start_port}/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+"""
+
 NGINX_LOAD_BALANCER = """  nginx:
     image: nginx:alpine
     container_name: nginx_lb
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
-      - "4444:80"
+      - "8080:80"
+    networks:
+      - mcpnet
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
@@ -146,6 +227,12 @@ class DockerComposeGenerator:
         pg_version = postgres_version or infra.get("postgres_version", "17-alpine")
         num_instances = instances or infra.get("gateway_instances", 1)
         redis_enabled = infra.get("redis_enabled", False)
+        benchmark_enabled = infra.get("benchmark_server_enabled", False)
+        benchmark_count = infra.get("benchmark_server_count", 10)
+        benchmark_start_port = infra.get("benchmark_start_port", 9000)
+        benchmark_tools = infra.get("benchmark_tools_per_server", 100)
+        benchmark_resources = infra.get("benchmark_resources_per_server", 10)
+        benchmark_prompts = infra.get("benchmark_prompts_per_server", 5)
 
         # Generate PostgreSQL configuration commands
         postgres_commands = self._generate_postgres_config(infra)
@@ -161,6 +248,19 @@ class DockerComposeGenerator:
         # Generate gateway services
         gateway_services = self._generate_gateway_services(num_instances, server, redis_enabled)
 
+        # Generate fast-time server (Go - always included for basic MCP testing)
+        fast_time_server = FAST_TIME_SERVER_TEMPLATE
+
+        # Generate fast-test server (Rust - always included for echo/stats tools)
+        fast_test_server = FAST_TEST_SERVER_TEMPLATE
+
+        # Generate benchmark servers
+        benchmark_servers = ""
+        if benchmark_enabled:
+            benchmark_servers = self._generate_benchmark_servers(
+                benchmark_count, benchmark_start_port, benchmark_tools, benchmark_resources, benchmark_prompts
+            )
+
         # Generate load balancer if multiple instances
         load_balancer = ""
         if num_instances > 1:
@@ -174,6 +274,9 @@ class DockerComposeGenerator:
             postgres_config_commands=postgres_commands,
             redis_service=redis_service,
             gateway_services=gateway_services,
+            fast_time_server=fast_time_server,
+            fast_test_server=fast_test_server,
+            benchmark_servers=benchmark_servers,
             load_balancer=load_balancer,
             redis_volume=redis_volume,
         )
@@ -256,12 +359,40 @@ class DockerComposeGenerator:
 
         return "\n".join(services)
 
+    def _generate_benchmark_servers(self, count: int, start_port: int, tools_per_server: int, resources_per_server: int, prompts_per_server: int) -> str:
+        """Generate benchmark server service definition.
+
+        Uses the benchmark server's multi-server mode to spawn multiple
+        HTTP servers within a single container, avoiding resource overhead
+        of running thousands of containers.
+
+        Args:
+            count: Number of MCP servers to spawn
+            start_port: First port number
+            tools_per_server: Number of tools each server should provide
+            resources_per_server: Number of resources each server should provide
+            prompts_per_server: Number of prompts each server should provide
+        """
+        end_port = start_port + count - 1
+        port_range = f"{start_port}-{end_port}:{start_port}-{end_port}"
+
+        service = BENCHMARK_SERVER_TEMPLATE.format(
+            server_count=count,
+            start_port=start_port,
+            port_range=port_range,
+            tools_per_server=tools_per_server,
+            resources_per_server=resources_per_server,
+            prompts_per_server=prompts_per_server,
+        )
+
+        return service
+
     def _generate_load_balancer(self, num_instances: int) -> str:
         """Generate nginx load balancer service"""
         depends = []
         for i in range(num_instances):
             suffix = f"_{i + 1}"
-            depends.append(f"      - gateway{suffix}")
+            depends.append(f"      gateway{suffix}:\n        condition: service_healthy")
 
         return NGINX_LOAD_BALANCER.format(nginx_depends="\n".join(depends))
 
@@ -273,7 +404,7 @@ class DockerComposeGenerator:
         upstreams = []
         for i in range(num_instances):
             suffix = f"_{i + 1}"
-            upstreams.append(f"        server gateway{suffix}:4444;")
+            upstreams.append(f"        server gateway{suffix}:4444 max_fails=3 fail_timeout=30s;")
 
         nginx_conf = f"""events {{
     worker_connections 1024;
@@ -289,10 +420,14 @@ http {{
 
         location / {{
             proxy_pass http://gateway_backend;
-            proxy_set_header Host $host;
+            proxy_set_header Host $http_host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-Host $http_host;
+
+            # Disable redirect rewriting to preserve backend URLs
+            proxy_redirect off;
 
             # Timeouts
             proxy_connect_timeout 60s;
@@ -320,7 +455,7 @@ http {{
 def main():
     parser = argparse.ArgumentParser(description="Generate docker-compose.yml from infrastructure profiles")
     parser.add_argument("--config", type=Path, default=Path("config.yaml"), help="Configuration file path")
-    parser.add_argument("--infrastructure", required=True, help="Infrastructure profile name")
+    parser.add_argument("--infrastructure", default="staging", help="Infrastructure profile name (default: staging)")
     parser.add_argument("--server-profile", default="standard", help="Server profile name")
     parser.add_argument("--postgres-version", help="PostgreSQL version (e.g., 17-alpine)")
     parser.add_argument("--instances", type=int, help="Number of gateway instances")

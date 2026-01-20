@@ -21,7 +21,7 @@ from typing import List, Optional
 import uuid
 
 # Third-Party
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
 # First-Party
@@ -256,24 +256,25 @@ class TokenCatalogService:
             payload["exp"] = int(expires_at.timestamp())
 
         # Add scoping information if available
+        # Empty permissions = defer to RBAC at runtime (not wildcard access)
         if scope:
             payload["scopes"] = {
                 "server_id": scope.server_id,
-                "permissions": scope.permissions or ["*"],
+                "permissions": scope.permissions if scope.permissions is not None else [],
                 "ip_restrictions": scope.ip_restrictions or [],
                 "time_restrictions": scope.time_restrictions or {},
             }
         else:
             payload["scopes"] = {
                 "server_id": None,
-                "permissions": ["*"],
+                "permissions": [],  # Empty = inherit from RBAC at runtime
                 "ip_restrictions": [],
                 "time_restrictions": {},
             }
 
         # Generate JWT token using the centralized token creation utility
         # The create_jwt_token will handle expiration and other standard claims
-        return await create_jwt_token(payload)
+        return await create_jwt_token(payload, expires_in_minutes=0)
 
     def _hash_token(self, token: str) -> str:
         """Create secure hash of token for storage.
@@ -292,6 +293,53 @@ class TokenCatalogService:
         """
         return hashlib.sha256(token.encode()).hexdigest()
 
+    def _validate_scope_containment(
+        self,
+        requested_permissions: Optional[List[str]],
+        caller_permissions: Optional[List[str]],
+    ) -> None:
+        """Validate that requested permissions don't exceed caller's permissions.
+
+        SECURITY: This is fail-secure. If caller_permissions is empty/None,
+        custom scopes are DENIED. Users without explicit permissions can only
+        create tokens with empty scope (inherit at runtime).
+
+        Args:
+            requested_permissions: Permissions requested for new/updated token
+            caller_permissions: Caller's effective permissions (RBAC + current token scopes)
+
+        Raises:
+            ValueError: If requested permissions exceed caller's permissions
+        """
+        # No requested permissions = empty scope, always allowed
+        if not requested_permissions:
+            return
+
+        # FAIL-SECURE: If caller has no permissions, deny any custom scope
+        if not caller_permissions:
+            raise ValueError("Cannot specify custom token permissions. " + "You have no explicit permissions to delegate. " + "Create a token without scope to inherit permissions at runtime.")
+
+        # Wildcard caller can grant anything
+        if "*" in caller_permissions:
+            return
+
+        # Wildcard request requires wildcard caller
+        if "*" in requested_permissions:
+            raise ValueError("Cannot create token with wildcard permissions. " + "Your effective permissions do not include wildcard access.")
+
+        # Check each requested permission
+        for req_perm in requested_permissions:
+            if req_perm in caller_permissions:
+                continue
+
+            # Check for category wildcard (e.g., "tools.*" allows "tools.read")
+            if "." in req_perm:
+                category = req_perm.split(".")[0]
+                if f"{category}.*" in caller_permissions:
+                    continue
+
+            raise ValueError(f"Cannot grant permission '{req_perm}' - not in your effective permissions.")
+
     async def create_token(
         self,
         user_email: str,
@@ -301,6 +349,7 @@ class TokenCatalogService:
         expires_in_days: Optional[int] = None,
         tags: Optional[List[str]] = None,
         team_id: Optional[str] = None,
+        caller_permissions: Optional[List[str]] = None,
     ) -> tuple[EmailApiToken, str]:
         """
         Create a new API token with team-level scoping and additional configurations.
@@ -325,6 +374,8 @@ class TokenCatalogService:
             expires_in_days (Optional[int]): The expiration time in days for the token (None means no expiration).
             tags (Optional[List[str]]): A list of organizational tags for the token (default is an empty list).
             team_id (Optional[str]): The team ID to which the token should be scoped. This is required for team-level scoping.
+            caller_permissions (Optional[List[str]]): The permissions of the caller creating the token. Used for
+                scope containment validation to ensure the new token cannot have broader permissions than the caller.
 
         Returns:
             tuple[EmailApiToken, str]: A tuple where the first element is the `EmailApiToken` database record and
@@ -353,6 +404,10 @@ class TokenCatalogService:
 
         if not user:
             raise ValueError(f"User not found: {user_email}")
+
+        # Validate scope containment (fail-secure if no caller_permissions)
+        if scope and scope.permissions:
+            self._validate_scope_containment(scope.permissions, caller_permissions)
 
         # Validate team exists and user is active member
         if team_id:
@@ -518,9 +573,16 @@ class TokenCatalogService:
         return result.scalar_one_or_none()
 
     async def update_token(
-        self, token_id: str, user_email: str, name: Optional[str] = None, description: Optional[str] = None, scope: Optional[TokenScope] = None, tags: Optional[List[str]] = None
+        self,
+        token_id: str,
+        user_email: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        scope: Optional[TokenScope] = None,
+        tags: Optional[List[str]] = None,
+        caller_permissions: Optional[List[str]] = None,
     ) -> Optional[EmailApiToken]:
-        """Update an existing token.
+        """Update an existing token with scope containment validation.
 
         Args:
             token_id: Token ID to update
@@ -529,6 +591,7 @@ class TokenCatalogService:
             description: New description
             scope: New scoping configuration
             tags: New tags
+            caller_permissions: Caller's effective permissions for scope containment
 
         Returns:
             Optional[EmailApiToken]: Updated token if found
@@ -543,6 +606,10 @@ class TokenCatalogService:
         token = await self.get_token(token_id, user_email)
         if not token:
             raise ValueError("Token not found or not authorized")
+
+        # Validate scope containment for scope changes
+        if scope and scope.permissions:
+            self._validate_scope_containment(scope.permissions, caller_permissions)
 
         # Check for duplicate name if changing
         if name and name != token.name:
@@ -575,22 +642,24 @@ class TokenCatalogService:
 
         return token
 
-    async def revoke_token(self, token_id: str, revoked_by: str, reason: Optional[str] = None) -> bool:
-        """Revoke a token immediately.
+    async def revoke_token(self, token_id: str, user_email: str, revoked_by: str, reason: Optional[str] = None) -> bool:
+        """Revoke a token owned by the specified user.
 
         Args:
             token_id: Token ID to revoke
-            revoked_by: Email of user revoking the token
+            user_email: Owner's email - token must belong to this user (ownership check)
+            revoked_by: Email of user performing revocation (for audit)
             reason: Optional reason for revocation
 
         Returns:
-            bool: True if token was revoked
+            bool: True if token was revoked, False if not found or not authorized
 
         Examples:
             >>> service = TokenCatalogService(None)  # Would use real DB session
             >>> # Returns bool: True if token was revoked successfully
         """
-        token = await self.get_token(token_id)
+        # SECURITY FIX: Filter by owner to prevent cross-user revocation
+        token = await self.get_token(token_id, user_email)
         if not token:
             return False
 
@@ -603,8 +672,62 @@ class TokenCatalogService:
         self.db.add(revocation)
         self.db.commit()
 
+        # Invalidate auth cache for revoked token
+        try:
+            # Standard
+            import asyncio  # pylint: disable=import-outside-toplevel
+
+            # First-Party
+            from mcpgateway.cache.auth_cache import auth_cache  # pylint: disable=import-outside-toplevel
+
+            asyncio.create_task(auth_cache.invalidate_revocation(token.jti))
+        except Exception as cache_error:
+            logger.debug(f"Failed to invalidate auth cache for revoked token: {cache_error}")
+
         logger.info(f"Revoked token '{token.name}' (JTI: {token.jti}) by {revoked_by}")
 
+        return True
+
+    async def admin_revoke_token(self, token_id: str, revoked_by: str, reason: Optional[str] = None) -> bool:
+        """Admin-only: Revoke any token without ownership check.
+
+        WARNING: This method bypasses ownership verification.
+        Only call from admin-authenticated endpoints.
+
+        Args:
+            token_id: Token ID to revoke
+            revoked_by: Admin email for audit
+            reason: Revocation reason
+
+        Returns:
+            bool: True if token was revoked, False if not found
+
+        Examples:
+            >>> service = TokenCatalogService(None)  # Would use real DB session
+            >>> # Returns bool: True if token was revoked successfully
+        """
+        # No user filter - admin can revoke any token
+        token = await self.get_token(token_id)
+        if not token:
+            return False
+
+        token.is_active = False
+        revocation = TokenRevocation(jti=token.jti, revoked_by=revoked_by, reason=reason)
+        self.db.add(revocation)
+        self.db.commit()
+
+        try:
+            # Standard
+            import asyncio  # pylint: disable=import-outside-toplevel
+
+            # First-Party
+            from mcpgateway.cache.auth_cache import auth_cache  # pylint: disable=import-outside-toplevel
+
+            asyncio.create_task(auth_cache.invalidate_revocation(token.jti))
+        except Exception as cache_error:
+            logger.debug(f"Failed to invalidate auth cache: {cache_error}")
+
+        logger.info(f"Admin revoked token '{token.name}' (JTI: {token.jti}) by {revoked_by}")
         return True
 
     async def is_token_revoked(self, jti: str) -> bool:
@@ -695,13 +818,110 @@ class TokenCatalogService:
         """
         start_date = utc_now() - timedelta(days=days)
 
-        query = select(TokenUsageLog).where(and_(TokenUsageLog.user_email == user_email, TokenUsageLog.timestamp >= start_date))
-
+        # Get token JTI if specific token requested
+        token_jti = None
         if token_id:
-            # Get JTI for the token
             token = await self.get_token(token_id, user_email)
             if token:
-                query = query.where(TokenUsageLog.token_jti == token.jti)
+                token_jti = token.jti
+
+        # Use SQL aggregation for PostgreSQL, Python fallback for SQLite
+        dialect_name = self.db.get_bind().dialect.name
+        if dialect_name == "postgresql":
+            return await self._get_usage_stats_postgresql(user_email, start_date, token_jti, days)
+        return await self._get_usage_stats_python(user_email, start_date, token_jti, days)
+
+    async def _get_usage_stats_postgresql(self, user_email: str, start_date: datetime, token_jti: Optional[str], days: int) -> dict:
+        """Compute usage stats using PostgreSQL SQL aggregation.
+
+        Args:
+            user_email: User's email address
+            start_date: Start date for analysis
+            token_jti: Optional token JTI filter
+            days: Number of days being analyzed
+
+        Returns:
+            dict: Usage statistics computed via SQL
+        """
+        # Build filter conditions
+        conditions = [TokenUsageLog.user_email == user_email, TokenUsageLog.timestamp >= start_date]
+        if token_jti:
+            conditions.append(TokenUsageLog.token_jti == token_jti)
+
+        base_filter = and_(*conditions)
+
+        # Main stats query using SQL aggregation
+        # Match Python behavior:
+        # - status_code must be non-null AND non-zero AND < 400 for success count
+        # - response_time_ms must be non-null AND non-zero for average (Python: if log.response_time_ms)
+        stats_query = (
+            select(
+                func.count().label("total"),  # pylint: disable=not-callable
+                func.sum(
+                    case(
+                        (and_(TokenUsageLog.status_code.isnot(None), TokenUsageLog.status_code > 0, TokenUsageLog.status_code < 400), 1),
+                        else_=0,
+                    )
+                ).label("successful"),
+                func.sum(case((TokenUsageLog.blocked.is_(True), 1), else_=0)).label("blocked"),
+                # Only average non-null and non-zero response times (NULL values are ignored by AVG)
+                func.avg(
+                    case(
+                        (and_(TokenUsageLog.response_time_ms.isnot(None), TokenUsageLog.response_time_ms > 0), TokenUsageLog.response_time_ms),
+                        else_=None,
+                    )
+                ).label("avg_response"),
+            )
+            .select_from(TokenUsageLog)
+            .where(base_filter)
+        )
+
+        result = self.db.execute(stats_query).fetchone()
+
+        total_requests = result.total or 0
+        successful_requests = result.successful or 0
+        blocked_requests = result.blocked or 0
+        avg_response_time = float(result.avg_response) if result.avg_response else 0.0
+
+        # Top endpoints query using SQL GROUP BY
+        # Match Python behavior: exclude None AND empty string endpoints (Python: if log.endpoint)
+        endpoints_query = (
+            select(TokenUsageLog.endpoint, func.count().label("count"))  # pylint: disable=not-callable
+            .where(and_(base_filter, TokenUsageLog.endpoint.isnot(None), TokenUsageLog.endpoint != ""))
+            .group_by(TokenUsageLog.endpoint)
+            .order_by(func.count().desc())  # pylint: disable=not-callable
+            .limit(5)
+        )
+
+        endpoints_result = self.db.execute(endpoints_query).fetchall()
+        top_endpoints = [(row.endpoint, row.count) for row in endpoints_result]
+
+        return {
+            "period_days": days,
+            "total_requests": total_requests,
+            "successful_requests": successful_requests,
+            "blocked_requests": blocked_requests,
+            "success_rate": successful_requests / total_requests if total_requests > 0 else 0,
+            "average_response_time_ms": round(avg_response_time, 2),
+            "top_endpoints": top_endpoints,
+        }
+
+    async def _get_usage_stats_python(self, user_email: str, start_date: datetime, token_jti: Optional[str], days: int) -> dict:
+        """Compute usage stats using Python (fallback for SQLite).
+
+        Args:
+            user_email: User's email address
+            start_date: Start date for analysis
+            token_jti: Optional token JTI filter
+            days: Number of days being analyzed
+
+        Returns:
+            dict: Usage statistics computed in Python
+        """
+        query = select(TokenUsageLog).where(and_(TokenUsageLog.user_email == user_email, TokenUsageLog.timestamp >= start_date))
+
+        if token_jti:
+            query = query.where(TokenUsageLog.token_jti == token_jti)
 
         usage_logs = self.db.execute(query).scalars().all()
 
@@ -715,7 +935,7 @@ class TokenCatalogService:
         avg_response_time = sum(response_times) / len(response_times) if response_times else 0
 
         # Most accessed endpoints
-        endpoint_counts = {}
+        endpoint_counts: dict = {}
         for log in usage_logs:
             if log.endpoint:
                 endpoint_counts[log.endpoint] = endpoint_counts.get(log.endpoint, 0) + 1
@@ -749,7 +969,11 @@ class TokenCatalogService:
         return result.scalar_one_or_none()
 
     async def cleanup_expired_tokens(self) -> int:
-        """Clean up expired tokens.
+        """Clean up expired tokens using bulk UPDATE.
+
+        Uses a single SQL UPDATE statement instead of loading tokens into memory
+        and updating them one by one. This is more efficient and avoids memory
+        issues when many tokens expire at once.
 
         Returns:
             int: Number of tokens cleaned up
@@ -758,13 +982,18 @@ class TokenCatalogService:
             >>> service = TokenCatalogService(None)  # Would use real DB session
             >>> # Returns int: Number of tokens cleaned up
         """
-        expired_tokens = self.db.execute(select(EmailApiToken).where(and_(EmailApiToken.expires_at < utc_now(), EmailApiToken.is_active.is_(True)))).scalars().all()
+        try:
+            now = utc_now()
+            count = self.db.query(EmailApiToken).filter(EmailApiToken.expires_at < now, EmailApiToken.is_active.is_(True)).update({"is_active": False}, synchronize_session=False)
 
-        for token in expired_tokens:
-            token.is_active = False
+            self.db.commit()
 
-        self.db.commit()
+            if count > 0:
+                logger.info(f"Cleaned up {count} expired tokens")
 
-        logger.info(f"Cleaned up {len(expired_tokens)} expired tokens")
+            return count
 
-        return len(expired_tokens)
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"Failed to cleanup expired tokens: {e}")
+            return 0

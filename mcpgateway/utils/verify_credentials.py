@@ -10,19 +10,26 @@ for securing API endpoints. It supports authentication via Authorization
 headers and cookies.
 Examples:
     >>> from mcpgateway.utils import verify_credentials as vc
+    >>> from mcpgateway.utils import jwt_config_helper as jch
     >>> from pydantic import SecretStr
     >>> class DummySettings:
     ...     jwt_secret_key = 'secret'
     ...     jwt_algorithm = 'HS256'
     ...     jwt_audience = 'mcpgateway-api'
     ...     jwt_issuer = 'mcpgateway'
+    ...     jwt_issuer_verification = True
     ...     jwt_audience_verification = True
+    ...     jwt_public_key_path = ''
+    ...     jwt_private_key_path = ''
     ...     basic_auth_user = 'user'
     ...     basic_auth_password = SecretStr('pass')
     ...     auth_required = True
     ...     require_token_expiration = False
+    ...     require_jti = False
+    ...     validate_token_environment = False
     ...     docs_allow_basic_auth = False
     >>> vc.settings = DummySettings()
+    >>> jch.settings = DummySettings()
     >>> import jwt
     >>> token = jwt.encode({'sub': 'alice', 'aud': 'mcpgateway-api', 'iss': 'mcpgateway'}, 'secret', algorithm='HS256')
     >>> import asyncio
@@ -68,10 +75,16 @@ logger = logging_service.get_logger(__name__)
 
 
 async def verify_jwt_token(token: str) -> dict:
-    """Verify and decode a JWT token.
+    """Verify and decode a JWT token in a single pass.
 
     Decodes and validates a JWT token using the configured secret key
-    and algorithm from settings. Checks for token expiration and validity.
+    and algorithm from settings. Uses PyJWT's require option for claim
+    enforcement instead of a separate unverified decode.
+
+    Note:
+        With single-pass decoding, signature validation occurs before
+        claim validation. An invalid signature will result in "Invalid token"
+        error even if the token is also missing required claims.
 
     Args:
         token: The JWT token string to verify.
@@ -81,7 +94,6 @@ async def verify_jwt_token(token: str) -> dict:
 
     Raises:
         HTTPException: If token is invalid, expired, or missing required claims.
-        MissingRequiredClaimError: If token is missing required expiration claim.
     """
     try:
         validate_jwt_algo_and_keys()
@@ -90,31 +102,54 @@ async def verify_jwt_token(token: str) -> dict:
         # First-Party
         from mcpgateway.utils.jwt_config_helper import get_jwt_public_key_or_secret
 
-        # First decode to check claims
-        unverified = jwt.decode(token, options={"verify_signature": False})
-
-        # Check for expiration claim
-        if "exp" not in unverified:
-            logger.warning(f"JWT token without expiration accepted. Consider enabling REQUIRE_TOKEN_EXPIRATION for better security. Token sub: {unverified.get('sub', 'unknown')}")
-            if settings.require_token_expiration:
-                raise jwt.MissingRequiredClaimError("exp")
-
-        options = {}
+        options = {
+            "verify_aud": settings.jwt_audience_verification,
+            "verify_iss": settings.jwt_issuer_verification,
+        }
 
         if settings.require_token_expiration:
             options["require"] = ["exp"]
-
-        options["verify_aud"] = settings.jwt_audience_verification
 
         decode_kwargs = {
             "key": get_jwt_public_key_or_secret(),
             "algorithms": [settings.jwt_algorithm],
             "options": options,
-            "audience": settings.jwt_audience,
-            "issuer": settings.jwt_issuer,
         }
 
+        if settings.jwt_audience_verification:
+            decode_kwargs["audience"] = settings.jwt_audience
+
+        if settings.jwt_issuer_verification:
+            decode_kwargs["issuer"] = settings.jwt_issuer
+
         payload = jwt.decode(token, **decode_kwargs)
+
+        # Log warning for tokens without expiration (when not required)
+        if not settings.require_token_expiration and "exp" not in payload:
+            logger.warning(f"JWT token without expiration accepted. Consider enabling REQUIRE_TOKEN_EXPIRATION for better security. Token sub: {payload.get('sub', 'unknown')}")
+
+        # Require JTI if configured
+        if settings.require_jti and "jti" not in payload:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token is missing required JTI claim. Set REQUIRE_JTI=false to allow.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # Log warning for tokens without JTI (when not required)
+        if not settings.require_jti and "jti" not in payload:
+            logger.warning(f"JWT token without JTI accepted. Token cannot be revoked. Consider enabling REQUIRE_JTI for better security. Token sub: {payload.get('sub', 'unknown')}")
+
+        # Validate environment claim if configured (reject mismatched, allow missing for backward compatibility)
+        if settings.validate_token_environment:
+            token_env = payload.get("env")
+            if token_env is not None and token_env != settings.environment:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=f"Token environment mismatch: token is for '{token_env}', server is '{settings.environment}'",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
         return payload
 
     except jwt.MissingRequiredClaimError:
@@ -137,6 +172,43 @@ async def verify_jwt_token(token: str) -> dict:
         )
 
 
+async def verify_jwt_token_cached(token: str, request: Optional[Request] = None) -> dict:
+    """Verify JWT token with request-level caching.
+
+    If a request object is provided and the token has already been verified
+    for this request, returns the cached payload. Otherwise, performs
+    verification and caches the result in request.state.
+
+    Args:
+        token: JWT token string to verify
+        request: Optional FastAPI/Starlette request for request-level caching.
+            Must have a 'state' attribute to enable caching.
+
+    Returns:
+        dict: Decoded and verified JWT payload
+
+    Raises:
+        HTTPException: If token is invalid, expired, or missing required claims.
+    """
+    # Check request.state cache first (safely handle non-Request objects)
+    if request is not None and hasattr(request, "state"):
+        cached = getattr(request.state, "_jwt_verified_payload", None)
+        # Verify cache is a valid tuple of (token, payload) before unpacking
+        if cached is not None and isinstance(cached, tuple) and len(cached) == 2:
+            cached_token, cached_payload = cached
+            if cached_token == token:
+                return cached_payload
+
+    # Verify token (single decode)
+    payload = await verify_jwt_token(token)
+
+    # Cache in request.state for reuse across middleware
+    if request is not None and hasattr(request, "state"):
+        request.state._jwt_verified_payload = (token, payload)
+
+    return payload
+
+
 async def verify_credentials(token: str) -> dict:
     """Verify credentials using a JWT token.
 
@@ -154,6 +226,7 @@ async def verify_credentials(token: str) -> dict:
 
     Examples:
         >>> from mcpgateway.utils import verify_credentials as vc
+        >>> from mcpgateway.utils import jwt_config_helper as jch
         >>> from pydantic import SecretStr
         >>> class DummySettings:
         ...     jwt_secret_key = 'secret'
@@ -161,12 +234,18 @@ async def verify_credentials(token: str) -> dict:
         ...     jwt_audience = 'mcpgateway-api'
         ...     jwt_issuer = 'mcpgateway'
         ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
+        ...     jwt_public_key_path = ''
+        ...     jwt_private_key_path = ''
         ...     basic_auth_user = 'user'
         ...     basic_auth_password = SecretStr('pass')
         ...     auth_required = True
         ...     require_token_expiration = False
+        ...     require_jti = False
+        ...     validate_token_environment = False
         ...     docs_allow_basic_auth = False
         >>> vc.settings = DummySettings()
+        >>> jch.settings = DummySettings()
         >>> import jwt
         >>> token = jwt.encode({'sub': 'alice', 'aud': 'mcpgateway-api', 'iss': 'mcpgateway'}, 'secret', algorithm='HS256')
         >>> import asyncio
@@ -177,6 +256,25 @@ async def verify_credentials(token: str) -> dict:
     payload = await verify_jwt_token(token)
     payload["token"] = token
     return payload
+
+
+async def verify_credentials_cached(token: str, request: Optional[Request] = None) -> dict:
+    """Verify credentials using a JWT token with request-level caching.
+
+    A wrapper around verify_jwt_token_cached that adds the original token
+    to the decoded payload for reference.
+
+    Args:
+        token: The JWT token string to verify.
+        request: Optional FastAPI/Starlette request for request-level caching.
+
+    Returns:
+        dict: The validated token payload with the original token added
+            under the 'token' key. Returns a copy to avoid mutating cached payload.
+    """
+    payload = await verify_jwt_token_cached(token, request)
+    # Return a copy with token added to avoid mutating the cached payload
+    return {**payload, "token": token}
 
 
 async def require_auth(request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security), jwt_token: Optional[str] = Cookie(default=None)) -> str | dict:
@@ -204,6 +302,7 @@ async def require_auth(request: Request, credentials: Optional[HTTPAuthorization
 
     Examples:
         >>> from mcpgateway.utils import verify_credentials as vc
+        >>> from mcpgateway.utils import jwt_config_helper as jch
         >>> from pydantic import SecretStr
         >>> class DummySettings:
         ...     jwt_secret_key = 'secret'
@@ -211,6 +310,9 @@ async def require_auth(request: Request, credentials: Optional[HTTPAuthorization
         ...     jwt_audience = 'mcpgateway-api'
         ...     jwt_issuer = 'mcpgateway'
         ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
+        ...     jwt_public_key_path = ''
+        ...     jwt_private_key_path = ''
         ...     basic_auth_user = 'user'
         ...     basic_auth_password = SecretStr('pass')
         ...     auth_required = True
@@ -218,8 +320,11 @@ async def require_auth(request: Request, credentials: Optional[HTTPAuthorization
         ...     trust_proxy_auth = False
         ...     proxy_user_header = 'X-Authenticated-User'
         ...     require_token_expiration = False
+        ...     require_jti = False
+        ...     validate_token_environment = False
         ...     docs_allow_basic_auth = False
         >>> vc.settings = DummySettings()
+        >>> jch.settings = DummySettings()
         >>> import jwt
         >>> from fastapi.security import HTTPAuthorizationCredentials
         >>> from fastapi import Request
@@ -258,7 +363,7 @@ async def require_auth(request: Request, credentials: Optional[HTTPAuthorization
             # Extract user from proxy header
             proxy_user = request.headers.get(settings.proxy_user_header)
             if proxy_user:
-                return {"sub": proxy_user, "source": "proxy", "token": None}
+                return {"sub": proxy_user, "source": "proxy", "token": None}  # nosec B105 - None is not a password
             # If no proxy header but proxy auth is trusted, treat as anonymous
             return "anonymous"
         else:
@@ -289,7 +394,7 @@ async def require_auth(request: Request, credentials: Optional[HTTPAuthorization
             detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return await verify_credentials(token) if token else "anonymous"
+    return await verify_credentials_cached(token, request) if token else "anonymous"
 
 
 async def verify_basic_credentials(credentials: HTTPBasicCredentials) -> str:
@@ -316,6 +421,7 @@ async def verify_basic_credentials(credentials: HTTPBasicCredentials) -> str:
         ...     jwt_audience = 'mcpgateway-api'
         ...     jwt_issuer = 'mcpgateway'
         ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
         ...     basic_auth_user = 'user'
         ...     basic_auth_password = SecretStr('pass')
         ...     auth_required = True
@@ -370,6 +476,7 @@ async def require_basic_auth(credentials: HTTPBasicCredentials = Depends(basic_s
         ...     jwt_audience = 'mcpgateway-api'
         ...     jwt_issuer = 'mcpgateway'
         ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
         ...     basic_auth_user = 'user'
         ...     basic_auth_password = SecretStr('pass')
         ...     auth_required = True
@@ -432,10 +539,13 @@ async def require_docs_basic_auth(auth_header: str) -> str:
         ...     jwt_audience = 'mcpgateway-api'
         ...     jwt_issuer = 'mcpgateway'
         ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
         ...     basic_auth_user = 'user'
         ...     basic_auth_password = SecretStr('pass')
         ...     auth_required = True
         ...     require_token_expiration = False
+        ...     require_jti = False
+        ...     validate_token_environment = False
         ...     docs_allow_basic_auth = True
         >>> vc.settings = DummySettings()
         >>> import base64, asyncio
@@ -559,15 +669,22 @@ async def require_docs_auth_override(
 
     Examples:
         >>> from mcpgateway.utils import verify_credentials as vc
+        >>> from mcpgateway.utils import jwt_config_helper as jch
         >>> class DummySettings:
         ...     jwt_secret_key = 'secret'
         ...     jwt_algorithm = 'HS256'
         ...     jwt_audience = 'mcpgateway-api'
         ...     jwt_issuer = 'mcpgateway'
         ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
+        ...     jwt_public_key_path = ''
+        ...     jwt_private_key_path = ''
         ...     docs_allow_basic_auth = False
         ...     require_token_expiration = False
+        ...     require_jti = False
+        ...     validate_token_environment = False
         >>> vc.settings = DummySettings()
+        >>> jch.settings = DummySettings()
         >>> import jwt
         >>> import asyncio
 
@@ -639,6 +756,7 @@ async def require_auth_override(
 
     Examples:
         >>> from mcpgateway.utils import verify_credentials as vc
+        >>> from mcpgateway.utils import jwt_config_helper as jch
         >>> from pydantic import SecretStr
         >>> class DummySettings:
         ...     jwt_secret_key = 'secret'
@@ -646,6 +764,9 @@ async def require_auth_override(
         ...     jwt_audience = 'mcpgateway-api'
         ...     jwt_issuer = 'mcpgateway'
         ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
+        ...     jwt_public_key_path = ''
+        ...     jwt_private_key_path = ''
         ...     basic_auth_user = 'user'
         ...     basic_auth_password = SecretStr('pass')
         ...     auth_required = True
@@ -653,8 +774,11 @@ async def require_auth_override(
         ...     trust_proxy_auth = False
         ...     proxy_user_header = 'X-Authenticated-User'
         ...     require_token_expiration = False
+        ...     require_jti = False
+        ...     validate_token_environment = False
         ...     docs_allow_basic_auth = False
         >>> vc.settings = DummySettings()
+        >>> jch.settings = DummySettings()
         >>> import jwt
         >>> import asyncio
 
@@ -749,8 +873,8 @@ async def require_admin_auth(
             if token:
                 db_session = next(get_db())
                 try:
-                    # Decode and verify JWT token
-                    payload = await verify_jwt_token(token)
+                    # Decode and verify JWT token (use cached version for performance)
+                    payload = await verify_jwt_token_cached(token, request)
                     username = payload.get("sub") or payload.get("username")  # Support both new and legacy formats
 
                     if username:

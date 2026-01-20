@@ -17,15 +17,16 @@ from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import hmac
-import json
 import logging
 from typing import Any, Dict, List, Optional
 
 # Third-Party
 import httpx
+import orjson
 from pydantic import BaseModel, Field
 
 # First-Party
+from mcpgateway.config import settings
 from mcpgateway.plugins.framework import (
     Plugin,
     PluginConfig,
@@ -128,7 +129,19 @@ class WebhookNotificationPlugin(Plugin):
         """
         super().__init__(config)
         self._cfg = WebhookNotificationConfig(**(config.config or {}))
-        self._client = httpx.AsyncClient()
+        self._client = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=settings.httpx_max_connections,
+                max_keepalive_connections=settings.httpx_max_keepalive_connections,
+                keepalive_expiry=settings.httpx_keepalive_expiry,
+            ),
+            timeout=httpx.Timeout(
+                connect=settings.httpx_connect_timeout,
+                read=settings.httpx_read_timeout,
+                write=settings.httpx_write_timeout,
+                pool=settings.httpx_pool_timeout,
+            ),
+        )
 
     async def _render_template(self, template: str, context: Dict[str, Any]) -> str:
         """Render a Jinja2-style template with the given context.
@@ -147,7 +160,7 @@ class WebhookNotificationPlugin(Plugin):
             if value is None:
                 result = result.replace(placeholder, "null")
             elif isinstance(value, (dict, list)):
-                result = result.replace(placeholder, json.dumps(value))
+                result = result.replace(placeholder, orjson.dumps(value).decode())
             else:
                 result = result.replace(placeholder, str(value))
         return result
@@ -204,7 +217,7 @@ class WebhookNotificationPlugin(Plugin):
 
         # Add payload data if enabled and size is reasonable
         if self._cfg.include_payload_data and payload_data:
-            payload_str = json.dumps(payload_data)
+            payload_str = orjson.dumps(payload_data).decode()
             if len(payload_str) <= self._cfg.max_payload_size:
                 template_context["payload"] = payload_data
 
@@ -381,6 +394,13 @@ class WebhookNotificationPlugin(Plugin):
         await self._notify_webhooks(EventType.RESOURCE_SUCCESS, context, metadata={"resource_uri": payload.uri})
         return ResourcePostFetchResult()
 
+    async def shutdown(self) -> None:
+        """Shutdown and cleanup HTTP client when plugin shuts down."""
+        client = getattr(self, "_client", None)
+        if client:
+            await client.aclose()
+            self._client = None
+
     async def __aenter__(self):
         """Async context manager entry.
 
@@ -391,5 +411,4 @@ class WebhookNotificationPlugin(Plugin):
 
     async def __aexit__(self, _exc_type, _exc_val, _exc_tb):
         """Async context manager exit - cleanup HTTP client."""
-        if hasattr(self, "_client"):
-            await self._client.aclose()
+        await self.shutdown()

@@ -31,30 +31,125 @@ Examples:
 
 # Standard
 import asyncio
+from contextlib import contextmanager
 from importlib.resources import files
-from typing import Any, cast
+import os
+import tempfile
+from typing import cast
 
 # Third-Party
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect
+from filelock import FileLock
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import Connection
+from sqlalchemy.orm import Session
 
 # First-Party
 from mcpgateway.config import settings
-from mcpgateway.db import A2AAgent, Base, EmailTeam, EmailUser, Gateway, Prompt, Resource, Server, SessionLocal, Tool
+from mcpgateway.db import A2AAgent, Base, EmailTeam, EmailUser, Gateway, Prompt, Resource, Server, Tool
 from mcpgateway.services.logging_service import LoggingService
+
+# Migration lock to prevent concurrent migrations from multiple workers
+_MIGRATION_LOCK_PATH = os.path.join(tempfile.gettempdir(), "mcpgateway_migration.lock")
+_MIGRATION_LOCK_TIMEOUT = 300  # seconds to wait for lock (5 minutes for slow migrations)
 
 # Initialize logging service first
 logging_service = LoggingService()
 logger = logging_service.get_logger(__name__)
 
 
-async def bootstrap_admin_user() -> None:
+def _column_exists(inspector, table_name: str, column_name: str) -> bool:
+    """Check whether a table has a specific column.
+
+    Args:
+        inspector: SQLAlchemy inspector for the active connection.
+        table_name: Table name to inspect.
+        column_name: Column name to check.
+
+    Returns:
+        True if the column exists, otherwise False.
+    """
+    try:
+        return any(col["name"] == column_name for col in inspector.get_columns(table_name))
+    except Exception:
+        return False
+
+
+def _schema_looks_current(inspector) -> bool:
+    """Best-effort check for unversioned databases that already match current schema.
+
+    Args:
+        inspector: SQLAlchemy inspector for the active connection.
+
+    Returns:
+        True when expected columns exist for a recent schema version.
+    """
+    return _column_exists(inspector, "tools", "display_name") and _column_exists(inspector, "gateways", "oauth_config") and _column_exists(inspector, "prompts", "custom_name")
+
+
+@contextmanager
+def advisory_lock(conn: Connection):
+    """
+    Acquire a distributed advisory lock to serialize migrations across multiple instances.
+
+    Behavior depends on the database backend:
+    - Postgres: Uses `pg_advisory_lock` (blocking)
+    - MySQL: Uses `GET_LOCK` (blocking with timeout)
+    - SQLite: Fallback to local `FileLock`
+
+    Args:
+        conn: Active SQLAlchemy connection
+
+    Yields:
+        None
+
+    Raises:
+        TimeoutError: If the lock cannot be acquired within the timeout period
+    """
+    dialect = conn.dialect.name
+    lock_id = "mcpgateway_migration"
+    # Postgres requires a BIGINT lock ID (arbitrary hash of the string)
+    pg_lock_id = 42424242424242
+
+    if dialect == "postgresql":
+        logger.info("Acquiring Postgres advisory lock...")
+        conn.execute(text(f"SELECT pg_advisory_lock({pg_lock_id})"))
+        try:
+            yield
+        finally:
+            logger.info("Releasing Postgres advisory lock...")
+            conn.execute(text(f"SELECT pg_advisory_unlock({pg_lock_id})"))
+
+    elif dialect in ["mysql", "mariadb"]:
+        logger.info("Acquiring MySQL advisory lock...")
+        # GET_LOCK returns 1 if successful, 0 if timed out, NULL on error
+        result = conn.execute(text(f"SELECT GET_LOCK('{lock_id}', {_MIGRATION_LOCK_TIMEOUT})")).scalar()
+        if result != 1:
+            raise TimeoutError(f"Could not acquire MySQL lock '{lock_id}' within {_MIGRATION_LOCK_TIMEOUT}s")
+        try:
+            yield
+        finally:
+            logger.info("Releasing MySQL advisory lock...")
+            conn.execute(text(f"SELECT RELEASE_LOCK('{lock_id}')"))
+
+    else:
+        # Fallback for SQLite (single-host/container) or other DBs
+        logger.info(f"Using FileLock fallback for {dialect}...")
+        file_lock = FileLock(_MIGRATION_LOCK_PATH, timeout=_MIGRATION_LOCK_TIMEOUT)
+        with file_lock:
+            yield
+
+
+async def bootstrap_admin_user(conn: Connection) -> None:
     """
     Bootstrap the platform admin user from environment variables.
 
     Creates the admin user if email authentication is enabled and the user doesn't exist.
     Also creates a personal team for the admin user if auto-creation is enabled.
+
+    Args:
+        conn: Active SQLAlchemy connection
     """
     if not settings.email_auth_enabled:
         logger.info("Email authentication disabled - skipping admin user bootstrap")
@@ -65,7 +160,8 @@ async def bootstrap_admin_user() -> None:
         # First-Party
         from mcpgateway.services.email_auth_service import EmailAuthService  # pylint: disable=import-outside-toplevel
 
-        with cast(Any, SessionLocal)() as db:
+        # Use session bound to the locked connection
+        with Session(bind=conn) as db:
             auth_service = EmailAuthService(db)
 
             # Check if admin user already exists
@@ -76,11 +172,10 @@ async def bootstrap_admin_user() -> None:
 
             # Create admin user
             logger.info(f"Creating platform admin user: {settings.platform_admin_email}")
-            admin_user = await auth_service.create_user(
+            admin_user = await auth_service.create_platform_admin(
                 email=settings.platform_admin_email,
                 password=settings.platform_admin_password.get_secret_value(),
                 full_name=settings.platform_admin_full_name,
-                is_admin=True,
             )
 
             # Mark admin user as email verified and require password change on first login
@@ -88,7 +183,13 @@ async def bootstrap_admin_user() -> None:
             from mcpgateway.db import utc_now  # pylint: disable=import-outside-toplevel
 
             admin_user.email_verified_at = utc_now()
-            admin_user.password_change_required = True  # Force admin to change default password
+            # Respect configuration: only require password change on bootstrap when enabled
+            if getattr(settings, "password_change_enforcement_enabled", True) and getattr(settings, "admin_require_password_change_on_bootstrap", True):
+                admin_user.password_change_required = True  # Force admin to change default password
+            try:
+                admin_user.password_changed_at = utc_now()
+            except Exception as exc:
+                logger.debug("Failed to set admin password_changed_at: %s", exc)
             db.commit()
 
             # Personal team is automatically created during user creation if enabled
@@ -104,11 +205,14 @@ async def bootstrap_admin_user() -> None:
         return
 
 
-async def bootstrap_default_roles() -> None:
+async def bootstrap_default_roles(conn: Connection) -> None:
     """Bootstrap default system roles and assign them to admin user.
 
     Creates essential RBAC roles and assigns administrative privileges
     to the platform admin user.
+
+    Args:
+        conn: Active SQLAlchemy connection
     """
     if not settings.email_auth_enabled:
         logger.info("Email authentication disabled - skipping default roles bootstrap")
@@ -116,15 +220,11 @@ async def bootstrap_default_roles() -> None:
 
     try:
         # First-Party
-        from mcpgateway.db import get_db  # pylint: disable=import-outside-toplevel
         from mcpgateway.services.email_auth_service import EmailAuthService  # pylint: disable=import-outside-toplevel
         from mcpgateway.services.role_service import RoleService  # pylint: disable=import-outside-toplevel
 
-        # Get database session
-        db_gen = get_db()
-        db = next(db_gen)
-
-        try:
+        # Use session bound to the locked connection
+        with Session(bind=conn) as db:
             role_service = RoleService(db)
             auth_service = EmailAuthService(db)
 
@@ -205,25 +305,26 @@ async def bootstrap_default_roles() -> None:
 
             logger.info("Default RBAC roles bootstrap completed successfully")
 
-        finally:
-            db.close()
-
     except Exception as e:
         logger.error(f"Failed to bootstrap default roles: {e}")
         # Don't fail the entire bootstrap process if role creation fails
         return
 
 
-def normalize_team_visibility() -> int:
+def normalize_team_visibility(conn: Connection) -> int:
     """Normalize team visibility values to the supported set {private, public}.
 
     Any team with an unsupported visibility (e.g., 'team') is set to 'private'.
+
+    Args:
+        conn: Active SQLAlchemy connection
 
     Returns:
         int: Number of teams updated
     """
     try:
-        with cast(Any, SessionLocal)() as db:
+        # Use session bound to the locked connection
+        with Session(bind=conn) as db:
             # Find teams with invalid visibility
             invalid = db.query(EmailTeam).filter(EmailTeam.visibility.notin_(["private", "public"]))
             count = 0
@@ -240,77 +341,23 @@ def normalize_team_visibility() -> int:
         return 0
 
 
-async def main() -> None:
-    """
-    Bootstrap or upgrade the database schema, then log readiness.
-
-    Runs `create_all()` + `alembic stamp head` on an empty DB, otherwise just
-    executes `alembic upgrade head`, leaving application data intact.
-    Also creates the platform admin user if email authentication is enabled.
-
-    Args:
-        None
-    """
-    engine = create_engine(settings.database_url)
-    ini_path = files("mcpgateway").joinpath("alembic.ini")
-    cfg = Config(str(ini_path))  # path in container
-    cfg.attributes["configure_logger"] = True
-
-    with engine.begin() as conn:
-        cfg.attributes["connection"] = conn
-        cfg.set_main_option("sqlalchemy.url", settings.database_url)
-
-        insp = inspect(conn)
-
-        if "gateways" not in insp.get_table_names():
-            logger.info("Empty DB detected - creating baseline schema")
-
-            # Apply MariaDB compatibility fixes if needed
-            if settings.database_url.startswith(("mariadb", "mysql")):
-                # pylint: disable=import-outside-toplevel
-                # First-Party
-                from mcpgateway.alembic.env import _modify_metadata_for_mariadb, mariadb_naming_convention
-
-                _modify_metadata_for_mariadb()
-                Base.metadata.naming_convention = mariadb_naming_convention
-                logger.info("Applied MariaDB compatibility modifications")
-
-            Base.metadata.create_all(bind=conn)
-            command.stamp(cfg, "head")
-        else:
-            logger.info("Running Alembic migrations to ensure schema is up to date")
-            command.upgrade(cfg, "head")
-
-    # Post-upgrade normalization passes
-    updated = normalize_team_visibility()
-    if updated:
-        logger.info(f"Normalized {updated} team record(s) to supported visibility values")
-
-    logger.info("Database ready")
-
-    # Bootstrap admin user after database is ready
-    await bootstrap_admin_user()
-
-    # Bootstrap default RBAC roles after admin user is created
-    await bootstrap_default_roles()
-
-    # Assign orphaned resources to admin personal team after all setup is complete
-    await bootstrap_resource_assignments()
-
-
-async def bootstrap_resource_assignments() -> None:
+async def bootstrap_resource_assignments(conn: Connection) -> None:
     """Assign orphaned resources to the platform admin's personal team.
 
     This ensures existing resources (from pre-multitenancy versions) are
     visible in the new team-based UI by assigning them to the admin's
     personal team with public visibility.
+
+    Args:
+        conn: Active SQLAlchemy connection
     """
     if not settings.email_auth_enabled:
         logger.info("Email authentication disabled - skipping resource assignment")
         return
 
     try:
-        with SessionLocal() as db:
+        # Use session bound to the locked connection
+        with Session(bind=conn) as db:
             # Find admin user and their personal team
             admin_user = db.query(EmailUser).filter(EmailUser.email == settings.platform_admin_email, EmailUser.is_admin.is_(True)).first()
 
@@ -359,6 +406,105 @@ async def bootstrap_resource_assignments() -> None:
 
     except Exception as e:
         logger.error(f"Failed to bootstrap resource assignments: {e}")
+
+
+async def main() -> None:
+    """
+    Bootstrap or upgrade the database schema, then log readiness.
+
+    Runs `create_all()` + `alembic stamp head` on an empty DB, otherwise just
+    executes `alembic upgrade head`, leaving application data intact.
+    Also creates the platform admin user if email authentication is enabled.
+
+    Uses distributed advisory locks (PG/MySQL) or file locking (SQLite)
+    to prevent race conditions when multiple workers start simultaneously.
+
+    Args:
+        None
+
+    Raises:
+        Exception: If migration or bootstrap fails
+    """
+    engine = create_engine(settings.database_url)
+    ini_path = files("mcpgateway").joinpath("alembic.ini")
+    cfg = Config(str(ini_path))  # path in container
+    cfg.attributes["configure_logger"] = True
+
+    # Use advisory lock to prevent concurrent migrations
+    try:
+        with engine.connect() as conn:
+            # Commit any open transaction on the connection before locking (though it should be fresh)
+            conn.commit()
+
+            with advisory_lock(conn):
+                logger.info("Acquired migration lock, checking database schema...")
+
+                # Pass the LOCKED connection to Alembic config
+                cfg.attributes["connection"] = conn
+
+                # Escape '%' characters in URL to avoid configparser interpolation errors
+                # (e.g., URL-encoded passwords like %40 for '@')
+                escaped_url = settings.database_url.replace("%", "%%")
+                cfg.set_main_option("sqlalchemy.url", escaped_url)
+
+                insp = inspect(conn)
+                table_names = insp.get_table_names()
+
+                if "gateways" not in table_names:
+                    logger.info("Empty DB detected - creating baseline schema")
+                    # Apply MariaDB compatibility fixes if needed
+                    if settings.database_url.startswith(("mariadb", "mysql")):
+                        # pylint: disable=import-outside-toplevel
+                        # First-Party
+                        from mcpgateway.alembic.env import _modify_metadata_for_mariadb, mariadb_naming_convention
+
+                        _modify_metadata_for_mariadb()
+                        Base.metadata.naming_convention = mariadb_naming_convention
+                        logger.info("Applied MariaDB compatibility modifications")
+
+                    Base.metadata.create_all(bind=conn)
+                    command.stamp(cfg, "head")
+                else:
+                    versions: list[str] = []
+                    if "alembic_version" in table_names:
+                        try:
+                            rows = conn.execute(text("SELECT version_num FROM alembic_version")).fetchall()
+                            versions = [row[0] for row in rows if row[0]]
+                        except Exception as exc:
+                            logger.warning("Failed to read alembic_version table: %s", exc)
+
+                    if not versions and _schema_looks_current(insp):
+                        logger.warning("Existing database has no Alembic revision rows; stamping head to avoid reapplying migrations")
+                        command.stamp(cfg, "head")
+                    else:
+                        logger.info("Running Alembic migrations to ensure schema is up to date")
+                        command.upgrade(cfg, "head")
+
+                # Post-upgrade normalization passes (inside lock to be safe)
+                updated = normalize_team_visibility(conn)
+                if updated:
+                    logger.info(f"Normalized {updated} team record(s) to supported visibility values")
+
+                # Bootstrap admin user after database is ready, using the LOCKED connection
+                await bootstrap_admin_user(conn)
+
+                # Bootstrap default RBAC roles after admin user is created
+                await bootstrap_default_roles(conn)
+
+                # Assign orphaned resources to admin personal team after all setup is complete
+                await bootstrap_resource_assignments(conn)
+
+                conn.commit()  # Ensure all migration changes are permanently committed
+
+    except Exception as e:
+        logger.error(f"Migration/Bootstrap failed: {e}")
+        # Allow retry logic or container restart to handle transient issues
+        raise
+    finally:
+        # Dispose the engine to close all connections in the pool
+        engine.dispose()
+
+    logger.info("Database ready")
 
 
 if __name__ == "__main__":

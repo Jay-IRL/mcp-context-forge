@@ -27,5 +27,17 @@ This page tracks all significant design decisions made for the MCP Gateway proje
 | 0020  | Multi-Format Packaging Strategy                    | Accepted  | Distribution   | 2025-10-27  |
 | 0021  | Built-in Proxy Capabilities vs Service Mesh        | Accepted  | Architecture   | 2025-10-27  |
 | 0022  | Elicitation Passthrough Implementation             | Accepted  | MCP Protocol   | 2025-10-26  |
+| 0023  | One-Time Authentication Servers                    | Accepted  | Security       | 2025-10-27  |
+| 0024  | Adopt **uvicorn[standard]** for Enhanced Server Performance | Accepted | Performance | 2025-12-21 |
+| 0025  | Adopt **Granian** as Alternative HTTP Server | Accepted | Performance | 2025-12-21 |
+| 0026  | Add **Hiredis** as Default Redis Parser | Accepted | Performance | 2025-12-21 |
+| 0027  | Migrate from **Psycopg2** to **Psycopg3** | Accepted | Database | 2025-01-15 |
+| 0028  | Authentication Data Caching | Accepted | Performance | 2025-01-15 |
+| 0029  | Registry and Admin Stats Caching | Accepted | Performance | 2025-01-15 |
+| 0030  | Metrics Cleanup and Rollup | Accepted | Performance | 2025-01-15 |
+| 0031  | Parallel Session Cleanup with asyncio.gather() | Accepted | Performance | 2025-01-15 |
+| 0032  | MCP Session Pool for Connection Reuse | Accepted | Performance | 2025-01-05 |
+| 0033  | Tool Lookup Cache for invoke_tool | Accepted | Performance | 2025-01-20 |
+| 0035  | Query Parameter Authentication for Gateways | Accepted | Security | 2026-01-19 |
 
 > ✳️ Add new decisions chronologically and link to them from this table.

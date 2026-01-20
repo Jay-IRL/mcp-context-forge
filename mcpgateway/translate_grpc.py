@@ -13,6 +13,7 @@ using automatic service discovery through gRPC server reflection.
 
 # Standard
 import asyncio
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 try:
@@ -97,10 +98,8 @@ class GrpcEndpoint:
         # Create channel
         if self._tls_enabled:
             if self._tls_cert_path and self._tls_key_path:
-                with open(self._tls_cert_path, "rb") as f:
-                    cert = f.read()
-                with open(self._tls_key_path, "rb") as f:
-                    key = f.read()
+                cert = await asyncio.to_thread(Path(self._tls_cert_path).read_bytes)
+                key = await asyncio.to_thread(Path(self._tls_key_path).read_bytes)
                 credentials = grpc.ssl_channel_credentials(root_certificates=cert, private_key=key)
                 self._channel = grpc.secure_channel(self._target, credentials)
             else:
@@ -173,7 +172,7 @@ class GrpcEndpoint:
                         # Add to pool (ignore if already exists)
                         try:
                             self._pool.Add(file_desc_proto)
-                        except Exception as e:  # noqa: B110
+                        except Exception as e:  # pylint: disable=broad-except
                             # Descriptor already in pool, safe to skip
                             logger.debug(f"Descriptor already in pool: {e}")
 

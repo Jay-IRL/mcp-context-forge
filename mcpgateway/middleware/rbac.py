@@ -37,8 +37,14 @@ security = HTTPBearer(auto_error=False)
 def get_db() -> Generator[Session, None, None]:
     """Get database session for dependency injection.
 
+    Commits the transaction on successful completion to avoid implicit rollbacks
+    for read-only operations. Rolls back explicitly on exception.
+
     Yields:
         Session: SQLAlchemy database session
+
+    Raises:
+        Exception: Re-raises any exception after rolling back the transaction.
 
     Examples:
         >>> gen = get_db()
@@ -49,6 +55,16 @@ def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
         yield db
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
     finally:
         db.close()
 
@@ -142,7 +158,7 @@ async def get_current_user_with_permissions(
 
         # Extract user from token using the email auth function
         # Pass request to get_current_user so plugins can store auth_method in request.state
-        user = await get_current_user(credentials, db, request=request)
+        user = await get_current_user(credentials, request=request)
 
         # Read auth_method and request_id from request.state
         # (auth_method set by plugin in get_current_user, request_id set by HTTP middleware)
@@ -252,12 +268,17 @@ def require_permission(permission: str, resource_type: Optional[str] = None):
             # Extract team_id from path parameters if available
             team_id = kwargs.get("team_id")
 
+            # If team_id is None or blank in kwargs then check
+            if not team_id:
+                # check if user_context has team_id
+                team_id = user_context.get("team_id", None)
+
             # First, check if any plugins want to handle permission checking
             # First-Party
             from mcpgateway.plugins.framework import get_plugin_manager, GlobalContext, HttpAuthCheckPermissionPayload, HttpHookType  # pylint: disable=import-outside-toplevel
 
             plugin_manager = get_plugin_manager()
-            if plugin_manager:
+            if plugin_manager and plugin_manager.has_hooks_for(HttpHookType.HTTP_AUTH_CHECK_PERMISSION):
                 # Get plugin contexts from user_context (stored in request.state by HttpAuthMiddleware)
                 # These enable cross-hook context sharing between HTTP_PRE_REQUEST and HTTP_AUTH_CHECK_PERMISSION
                 plugin_context_table = user_context.get("plugin_context_table")
@@ -473,6 +494,11 @@ def require_any_permission(permissions: List[str], resource_type: Optional[str] 
 
             # Extract team_id from path parameters if available
             team_id = kwargs.get("team_id")
+
+            # If team_id is None or blank in kwargs then check
+            if not team_id:
+                # check if user_context has team_id
+                team_id = user_context.get("team_id", None)
 
             # Check if user has any of the required permissions
             granted = False

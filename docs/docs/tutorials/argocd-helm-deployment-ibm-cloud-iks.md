@@ -107,7 +107,7 @@ podman build -t mcp-context-forge:dev -f Containerfile .
 !!! note "Production deployments"
     Production deployments can pull the signed image directly:
     ```
-    ghcr.io/ibm/mcp-context-forge:0.9.0
+    ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
     ```
 
 ---
@@ -417,9 +417,6 @@ mcpContextForge:
     - name: CACHE_TYPE
       value: "redis"
 
-    - name: FEDERATION_ENABLED
-      value: "true"
-
   # Resource limits
   resources:
     limits:
@@ -578,7 +575,7 @@ kubectl create secret generic redis-secret -n mcp \
 kubectl create secret generic mcp-gateway-secret -n mcp \
   --from-literal=JWT_SECRET_KEY="$JWT_SECRET" \
   --from-literal=BASIC_AUTH_PASSWORD="$BASIC_AUTH_PASSWORD" \
-  --from-literal=DATABASE_URL="postgresql://mcpgateway:$POSTGRES_PASSWORD@mcp-stack-postgres:5432/mcpgateway" \
+  --from-literal=DATABASE_URL="postgresql+psycopg://mcpgateway:$POSTGRES_PASSWORD@mcp-stack-postgres:5432/mcpgateway" \
   --from-literal=REDIS_URL="redis://:$REDIS_PASSWORD@mcp-stack-redis:6379/0"
 
 # Store passwords securely for later use
@@ -875,7 +872,7 @@ USER=$(echo "$CREDS" | jq -r '.[0].credentials.connection.postgres.authenticatio
 PASS=$(echo "$CREDS" | jq -r '.[0].credentials.connection.postgres.authentication.password')
 DATABASE=$(echo "$CREDS" | jq -r '.[0].credentials.connection.postgres.database')
 
-MANAGED_DB_URL="postgresql://${USER}:${PASS}@${HOST}:${PORT}/${DATABASE}?sslmode=require"
+MANAGED_DB_URL="postgresql+psycopg://${USER}:${PASS}@${HOST}:${PORT}/${DATABASE}?sslmode=require"
 
 # 3. Update database URL secret
 kubectl patch secret mcp-gateway-secret -n mcp \

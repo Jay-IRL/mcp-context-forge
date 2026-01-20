@@ -24,13 +24,13 @@ try:
     from pydantic import ValidationError
 
     # First-Party
-    from mcpgateway.config import get_settings, Settings
+    from mcpgateway.config import Settings
 except ImportError as e:
     print(f"Import error: {e}")
     sys.exit(1)
 
 
-def TestOneInput(data: bytes) -> None:
+def TestOneInput(data: bytes) -> None:  # noqa: N802
     """Fuzz target for configuration parsing.
 
     Args:
@@ -62,14 +62,10 @@ def TestOneInput(data: bytes) -> None:
                     kwargs[field] = fdp.ConsumeIntInRange(-1000, 65535)
 
             # Boolean fields
-            bool_fields = ["skip_ssl_verify", "auth_required", "federation_enabled", "docs_allow_basic_auth", "federation_discovery"]
+            bool_fields = ["skip_ssl_verify", "auth_required", "docs_allow_basic_auth"]
             for field in bool_fields:
                 if fdp.ConsumeBool():
                     kwargs[field] = fdp.ConsumeBool()
-
-            # List fields
-            if fdp.ConsumeBool():
-                kwargs["federation_peers"] = [fdp.ConsumeUnicodeNoSurrogates(50) for _ in range(fdp.ConsumeIntInRange(0, 5))]
 
             settings = Settings(**kwargs)
 

@@ -14,10 +14,13 @@ from typing import List, Optional
 
 # Third-Party
 from fastapi import APIRouter, Depends, HTTPException, Query
+import orjson
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 # First-Party
 from mcpgateway.db import SessionLocal
+from mcpgateway.middleware.rbac import get_current_user_with_permissions, require_permission
 from mcpgateway.schemas import ObservabilitySpanRead, ObservabilityTraceRead, ObservabilityTraceWithSpans
 from mcpgateway.services.observability_service import ObservabilityService
 
@@ -27,18 +30,35 @@ router = APIRouter(prefix="/observability", tags=["Observability"])
 def get_db():
     """Database session dependency.
 
+    Commits the transaction on successful completion to avoid implicit rollbacks
+    for read-only operations. Rolls back explicitly on exception.
+
     Yields:
         Session: SQLAlchemy database session
+
+    Raises:
+        Exception: Re-raises any exception after rolling back the transaction.
     """
     db = SessionLocal()
     try:
         yield db
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
     finally:
         db.close()
 
 
 @router.get("/traces", response_model=List[ObservabilityTraceRead])
-def list_traces(
+@require_permission("admin.system_config")
+async def list_traces(
     start_time: Optional[datetime] = Query(None, description="Filter traces after this time"),
     end_time: Optional[datetime] = Query(None, description="Filter traces before this time"),
     min_duration_ms: Optional[float] = Query(None, ge=0, description="Minimum duration in milliseconds"),
@@ -51,6 +71,7 @@ def list_traces(
     limit: int = Query(100, ge=1, le=1000, description="Maximum results"),
     offset: int = Query(0, ge=0, description="Result offset"),
     db: Session = Depends(get_db),
+    _user=Depends(get_current_user_with_permissions),
 ):
     """List traces with optional filtering.
 
@@ -78,7 +99,9 @@ def list_traces(
         List[ObservabilityTraceRead]: List of traces matching filters
 
     Examples:
+        >>> import asyncio
         >>> import mcpgateway.routers.observability as obs
+        >>> from mcpgateway.config import settings
         >>> class FakeTrace:
         ...     def __init__(self, trace_id='t1'):
         ...         self.trace_id = trace_id
@@ -95,7 +118,10 @@ def list_traces(
         ...     def query_traces(self, **kwargs):
         ...         return [FakeTrace('t1')]
         >>> obs.ObservabilityService = FakeService
-        >>> obs.list_traces(db=None)[0].trace_id
+        >>> async def run_list_traces():
+        ...     traces = await obs.list_traces(db=None, _user={"email": settings.platform_admin_email, "db": None})
+        ...     return traces[0].trace_id
+        >>> asyncio.run(run_list_traces())
         't1'
     """
     service = ObservabilityService()
@@ -117,10 +143,12 @@ def list_traces(
 
 
 @router.post("/traces/query", response_model=List[ObservabilityTraceRead])
-def query_traces_advanced(
+@require_permission("admin.system_config")
+async def query_traces_advanced(
     # Third-Party
     request_body: dict,
     db: Session = Depends(get_db),
+    _user=Depends(get_current_user_with_permissions),
 ):
     """Advanced trace querying with attribute filtering.
 
@@ -157,11 +185,15 @@ def query_traces_advanced(
         HTTPException: 400 error if request body is invalid
 
     Examples:
+        >>> import asyncio
         >>> from fastapi import HTTPException
-        >>> try:
-        ...     query_traces_advanced({"start_time": "not-a-date"}, db=None)
-        ... except HTTPException as e:
-        ...     (e.status_code, "Invalid request body" in str(e.detail))
+        >>> from mcpgateway.config import settings
+        >>> async def run_invalid_query():
+        ...     try:
+        ...         await query_traces_advanced({"start_time": "not-a-date"}, db=None, _user={"email": settings.platform_admin_email, "db": None})
+        ...     except HTTPException as e:
+        ...         return (e.status_code, "Invalid request body" in str(e.detail))
+        >>> asyncio.run(run_invalid_query())
         (400, True)
 
         >>> import mcpgateway.routers.observability as obs
@@ -174,7 +206,10 @@ def query_traces_advanced(
         ...     def query_traces(self, **kwargs):
         ...         return [FakeTrace()]
         >>> obs.ObservabilityService = FakeService2
-        >>> obs.query_traces_advanced({}, db=None)[0].trace_id
+        >>> async def run_query_traces():
+        ...     traces = await obs.query_traces_advanced({}, db=None, _user={"email": settings.platform_admin_email, "db": None})
+        ...     return traces[0].trace_id
+        >>> asyncio.run(run_query_traces())
         'tx'
     """
     # Third-Party
@@ -222,7 +257,8 @@ def query_traces_advanced(
 
 
 @router.get("/traces/{trace_id}", response_model=ObservabilityTraceWithSpans)
-def get_trace(trace_id: str, db: Session = Depends(get_db)):
+@require_permission("admin.system_config")
+async def get_trace(trace_id: str, db: Session = Depends(get_db), _user=Depends(get_current_user_with_permissions)):
     """Get a trace by ID with all its spans and events.
 
     Returns a complete trace with all nested spans and their events,
@@ -239,21 +275,28 @@ def get_trace(trace_id: str, db: Session = Depends(get_db)):
         HTTPException: 404 if trace not found
 
     Examples:
+        >>> import asyncio
         >>> import mcpgateway.routers.observability as obs
+        >>> from mcpgateway.config import settings
         >>> class FakeService:
         ...     def get_trace_with_spans(self, db, trace_id):
         ...         return None
         >>> obs.ObservabilityService = FakeService
-        >>> try:
-        ...     obs.get_trace('missing', db=None)
-        ... except obs.HTTPException as e:
-        ...     e.status_code
+        >>> async def run_missing_trace():
+        ...     try:
+        ...         await obs.get_trace("missing", db=None, _user={"email": settings.platform_admin_email, "db": None})
+        ...     except obs.HTTPException as e:
+        ...         return e.status_code
+        >>> asyncio.run(run_missing_trace())
         404
         >>> class FakeService2:
         ...     def get_trace_with_spans(self, db, trace_id):
         ...         return {'trace_id': trace_id}
         >>> obs.ObservabilityService = FakeService2
-        >>> obs.get_trace('found', db=None)['trace_id']
+        >>> async def run_found_trace():
+        ...     trace = await obs.get_trace("found", db=None, _user={"email": settings.platform_admin_email, "db": None})
+        ...     return trace["trace_id"]
+        >>> asyncio.run(run_found_trace())
         'found'
     """
     service = ObservabilityService()
@@ -264,7 +307,8 @@ def get_trace(trace_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/spans", response_model=List[ObservabilitySpanRead])
-def list_spans(
+@require_permission("admin.system_config")
+async def list_spans(
     trace_id: Optional[str] = Query(None, description="Filter by trace ID"),
     resource_type: Optional[str] = Query(None, description="Filter by resource type"),
     resource_name: Optional[str] = Query(None, description="Filter by resource name"),
@@ -273,6 +317,7 @@ def list_spans(
     limit: int = Query(100, ge=1, le=1000, description="Maximum results"),
     offset: int = Query(0, ge=0, description="Result offset"),
     db: Session = Depends(get_db),
+    _user=Depends(get_current_user_with_permissions),
 ):
     """List spans with optional filtering.
 
@@ -293,7 +338,9 @@ def list_spans(
         List[ObservabilitySpanRead]: List of spans matching filters
 
     Examples:
+        >>> import asyncio
         >>> import mcpgateway.routers.observability as obs
+        >>> from mcpgateway.config import settings
         >>> class FakeSpan:
         ...     def __init__(self):
         ...         self.span_id = 's1'
@@ -303,7 +350,10 @@ def list_spans(
         ...     def query_spans(self, **kwargs):
         ...         return [FakeSpan()]
         >>> obs.ObservabilityService = FakeService
-        >>> obs.list_spans(db=None)[0].span_id
+        >>> async def run_list_spans():
+        ...     spans = await obs.list_spans(db=None, _user={"email": settings.platform_admin_email, "db": None})
+        ...     return spans[0].span_id
+        >>> asyncio.run(run_list_spans())
         's1'
     """
     service = ObservabilityService()
@@ -321,9 +371,11 @@ def list_spans(
 
 
 @router.delete("/traces/cleanup")
-def cleanup_old_traces(
+@require_permission("admin.system_config")
+async def cleanup_old_traces(
     days: int = Query(7, ge=1, description="Delete traces older than this many days"),
     db: Session = Depends(get_db),
+    _user=Depends(get_current_user_with_permissions),
 ):
     """Delete traces older than a specified number of days.
 
@@ -338,13 +390,17 @@ def cleanup_old_traces(
         dict: Number of deleted traces and cutoff time
 
     Examples:
+        >>> import asyncio
         >>> import mcpgateway.routers.observability as obs
+        >>> from mcpgateway.config import settings
         >>> class FakeService:
         ...     def delete_old_traces(self, db, cutoff):
         ...         return 5
         >>> obs.ObservabilityService = FakeService
-        >>> res = obs.cleanup_old_traces(days=7, db=None)
-        >>> res['deleted']
+        >>> async def run_cleanup():
+        ...     res = await obs.cleanup_old_traces(days=7, db=None, _user={"email": settings.platform_admin_email, "db": None})
+        ...     return res["deleted"]
+        >>> asyncio.run(run_cleanup())
         5
     """
     service = ObservabilityService()
@@ -354,9 +410,11 @@ def cleanup_old_traces(
 
 
 @router.get("/stats")
-def get_stats(
+@require_permission("admin.system_config")
+async def get_stats(
     hours: int = Query(24, ge=1, le=168, description="Time window in hours"),
     db: Session = Depends(get_db),
+    _user=Depends(get_current_user_with_permissions),
 ):
     """Get observability statistics.
 
@@ -413,10 +471,12 @@ def get_stats(
 
 
 @router.post("/traces/export")
-def export_traces(
+@require_permission("admin.system_config")
+async def export_traces(
     request_body: dict,
     format: str = Query("json", description="Export format (json, csv, ndjson)"),
     db: Session = Depends(get_db),
+    _user=Depends(get_current_user_with_permissions),
 ):
     """Export traces in various formats.
 
@@ -440,14 +500,18 @@ def export_traces(
         HTTPException: 400 error if format is invalid or export fails
 
     Examples:
-        >>> from fastapi import HTTPException
-        >>> try:
-        ...     export_traces({}, format="xml", db=None)
-        ... except HTTPException as e:
-        ...     (e.status_code, "format must be one of" in str(e.detail))
-        (400, True)
-        >>> import mcpgateway.routers.observability as obs
+        >>> import asyncio
         >>> from datetime import datetime
+        >>> from fastapi import HTTPException
+        >>> import mcpgateway.routers.observability as obs
+        >>> from mcpgateway.config import settings
+        >>> async def run_invalid_export():
+        ...     try:
+        ...         await export_traces({}, format="xml", db=None, _user={"email": settings.platform_admin_email, "db": None})
+        ...     except HTTPException as e:
+        ...         return (e.status_code, "format must be one of" in str(e.detail))
+        >>> asyncio.run(run_invalid_export())
+        (400, True)
         >>> class FakeTrace:
         ...     def __init__(self):
         ...         self.trace_id = 'tx'
@@ -464,14 +528,20 @@ def export_traces(
         ...     def query_traces(self, **kwargs):
         ...         return [FakeTrace()]
         >>> obs.ObservabilityService = FakeService
-        >>> out = obs.export_traces({}, format='json', db=None)
-        >>> out[0]['trace_id']
+        >>> async def run_json_export():
+        ...     out = await obs.export_traces({}, format="json", db=None, _user={"email": settings.platform_admin_email, "db": None})
+        ...     return out[0]["trace_id"]
+        >>> asyncio.run(run_json_export())
         'tx'
-        >>> resp = obs.export_traces({}, format='csv', db=None)
-        >>> hasattr(resp, 'media_type') and 'csv' in resp.media_type
+        >>> async def run_csv_export():
+        ...     resp = await obs.export_traces({}, format="csv", db=None, _user={"email": settings.platform_admin_email, "db": None})
+        ...     return hasattr(resp, "media_type") and "csv" in resp.media_type
+        >>> asyncio.run(run_csv_export())
         True
-        >>> resp2 = obs.export_traces({}, format='ndjson', db=None)
-        >>> type(resp2).__name__
+        >>> async def run_ndjson_export():
+        ...     resp2 = await obs.export_traces({}, format="ndjson", db=None, _user={"email": settings.platform_admin_email, "db": None})
+        ...     return type(resp2).__name__
+        >>> asyncio.run(run_ndjson_export())
         'StreamingResponse'
     """
     # Standard
@@ -560,10 +630,7 @@ def export_traces(
                     str: A JSON-encoded line (with trailing newline) for a trace.
                 """
                 for t in traces:
-                    # Standard
-                    import json
-
-                    yield json.dumps(
+                    yield orjson.dumps(
                         {
                             "trace_id": t.trace_id,
                             "name": t.name,
@@ -574,7 +641,7 @@ def export_traces(
                             "http_status_code": t.http_status_code,
                             "user_email": t.user_email,
                         }
-                    ) + "\n"
+                    ).decode() + "\n"
 
             return StreamingResponse(generate(), media_type="application/x-ndjson", headers={"Content-Disposition": "attachment; filename=traces.ndjson"})
 
@@ -583,7 +650,12 @@ def export_traces(
 
 
 @router.get("/analytics/query-performance")
-def get_query_performance(hours: int = Query(24, ge=1, le=168, description="Time window in hours"), db: Session = Depends(get_db)):
+@require_permission("admin.system_config")
+async def get_query_performance(
+    hours: int = Query(24, ge=1, le=168, description="Time window in hours"),
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user_with_permissions),
+):
     """Get query performance analytics.
 
     Returns performance metrics about trace queries including:
@@ -599,39 +671,127 @@ def get_query_performance(hours: int = Query(24, ge=1, le=168, description="Time
         dict: Performance analytics
 
     Examples:
+        >>> import asyncio
         >>> import mcpgateway.routers.observability as obs
+        >>> from mcpgateway.config import settings
+        >>> class MockDialect:
+        ...     name = "sqlite"
+        >>> class MockBind:
+        ...     dialect = MockDialect()
         >>> class EmptyDB:
+        ...     def get_bind(self):
+        ...         return MockBind()
         ...     def query(self, *a, **k):
         ...         return self
         ...     def filter(self, *a, **k):
         ...         return self
         ...     def all(self):
         ...         return []
-        >>> obs.get_query_performance(hours=1, db=EmptyDB())['total_traces']
+        >>> async def run_empty_stats():
+        ...     return (await obs.get_query_performance(hours=1, db=EmptyDB(), _user={"email": settings.platform_admin_email, "db": None}))["total_traces"]
+        >>> asyncio.run(run_empty_stats())
         0
 
         >>> class SmallDB:
+        ...     def get_bind(self):
+        ...         return MockBind()
         ...     def query(self, *a, **k):
         ...         return self
         ...     def filter(self, *a, **k):
         ...         return self
         ...     def all(self):
         ...         return [(10,), (20,), (30,), (40,)]
-        >>> res = obs.get_query_performance(hours=1, db=SmallDB())
-        >>> res['total_traces']
+        >>> async def run_small_stats():
+        ...     return await obs.get_query_performance(hours=1, db=SmallDB(), _user={"email": settings.platform_admin_email, "db": None})
+        >>> res = asyncio.run(run_small_stats())
+        >>> res["total_traces"]
         4
 
     """
 
-    # Third-Party
-
     # First-Party
-    from mcpgateway.db import ObservabilityTrace
 
     ObservabilityService()
     cutoff_time = datetime.now() - timedelta(hours=hours)
 
-    # Get duration percentiles using SQL
+    # Use SQL aggregation for PostgreSQL, Python fallback for SQLite
+    dialect_name = db.get_bind().dialect.name
+    if dialect_name == "postgresql":
+        return _get_query_performance_postgresql(db, cutoff_time, hours)
+    return _get_query_performance_python(db, cutoff_time, hours)
+
+
+def _get_query_performance_postgresql(db: Session, cutoff_time: datetime, hours: int) -> dict:
+    """Compute query performance using PostgreSQL percentile_cont.
+
+    Args:
+        db: Database session
+        cutoff_time: Start time for analysis
+        hours: Time window in hours
+
+    Returns:
+        dict: Performance analytics computed via SQL
+    """
+    stats_sql = text(
+        """
+        SELECT
+            COUNT(*) as total_traces,
+            percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_ms) as p50,
+            percentile_cont(0.75) WITHIN GROUP (ORDER BY duration_ms) as p75,
+            percentile_cont(0.90) WITHIN GROUP (ORDER BY duration_ms) as p90,
+            percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) as p95,
+            percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms) as p99,
+            AVG(duration_ms) as avg_duration,
+            MIN(duration_ms) as min_duration,
+            MAX(duration_ms) as max_duration
+        FROM observability_traces
+        WHERE start_time >= :cutoff_time AND duration_ms IS NOT NULL
+        """
+    )
+
+    result = db.execute(stats_sql, {"cutoff_time": cutoff_time}).fetchone()
+
+    if not result or result.total_traces == 0:
+        return {
+            "time_window_hours": hours,
+            "total_traces": 0,
+            "percentiles": {},
+            "avg_duration_ms": 0,
+            "min_duration_ms": 0,
+            "max_duration_ms": 0,
+        }
+
+    return {
+        "time_window_hours": hours,
+        "total_traces": result.total_traces,
+        "percentiles": {
+            "p50": round(float(result.p50), 2) if result.p50 else 0,
+            "p75": round(float(result.p75), 2) if result.p75 else 0,
+            "p90": round(float(result.p90), 2) if result.p90 else 0,
+            "p95": round(float(result.p95), 2) if result.p95 else 0,
+            "p99": round(float(result.p99), 2) if result.p99 else 0,
+        },
+        "avg_duration_ms": round(float(result.avg_duration), 2) if result.avg_duration else 0,
+        "min_duration_ms": round(float(result.min_duration), 2) if result.min_duration else 0,
+        "max_duration_ms": round(float(result.max_duration), 2) if result.max_duration else 0,
+    }
+
+
+def _get_query_performance_python(db: Session, cutoff_time: datetime, hours: int) -> dict:
+    """Compute query performance using Python (fallback for SQLite).
+
+    Args:
+        db: Database session
+        cutoff_time: Start time for analysis
+        hours: Time window in hours
+
+    Returns:
+        dict: Performance analytics computed in Python
+    """
+    # First-Party
+    from mcpgateway.db import ObservabilityTrace
+
+    # Get duration percentiles
     traces_with_duration = db.query(ObservabilityTrace.duration_ms).filter(ObservabilityTrace.start_time >= cutoff_time, ObservabilityTrace.duration_ms.isnot(None)).all()
 
     durations = sorted([t[0] for t in traces_with_duration if t[0] is not None])
@@ -647,6 +807,15 @@ def get_query_performance(hours: int = Query(24, ge=1, le=168, description="Time
         }
 
     def percentile(data, p):
+        """Compute percentile using linear interpolation matching PostgreSQL percentile_cont.
+
+        Args:
+            data: Sorted list of numeric values.
+            p: Percentile value between 0 and 1.
+
+        Returns:
+            Interpolated percentile value.
+        """
         n = len(data)
         if n == 0:
             return 0

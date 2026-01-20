@@ -29,6 +29,7 @@ from starlette.responses import Response
 from mcpgateway.config import settings
 from mcpgateway.db import SessionLocal
 from mcpgateway.instrumentation.sqlalchemy import attach_trace_to_session
+from mcpgateway.middleware.path_filter import should_skip_observability
 from mcpgateway.services.observability_service import current_trace_id, ObservabilityService, parse_traceparent
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,7 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         # Skip health checks and static files to reduce noise
-        if request.url.path in ["/health", "/healthz", "/ready", "/metrics"] or request.url.path.startswith("/static/"):
+        if should_skip_observability(request.url.path):
             return await call_next(request)
 
         # Extract request context
@@ -146,6 +147,7 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
             # Close db if it was created
             if db:
                 try:
+                    db.rollback()  # Error path - rollback any partial transaction
                     db.close()
                 except Exception as close_error:
                     logger.debug(f"Failed to close database session during cleanup: {close_error}")
@@ -159,14 +161,29 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
 
             # End span successfully
             if span_id:
-                self.service.end_span(
-                    db, span_id, status="ok" if status_code < 400 else "error", attributes={"http.status_code": status_code, "http.response_size": response.headers.get("content-length")}
-                )
+                try:
+                    self.service.end_span(
+                        db,
+                        span_id,
+                        status="ok" if status_code < 400 else "error",
+                        attributes={"http.status_code": status_code, "http.response_size": response.headers.get("content-length")},
+                    )
+                except Exception as end_span_error:
+                    logger.warning(f"Failed to end span {span_id}: {end_span_error}")
 
             # End trace
             if trace_id:
                 duration_ms = (time.time() - start_time) * 1000
-                self.service.end_trace(db, trace_id, status="ok" if status_code < 400 else "error", http_status_code=status_code, attributes={"response_time_ms": duration_ms})
+                try:
+                    self.service.end_trace(
+                        db,
+                        trace_id,
+                        status="ok" if status_code < 400 else "error",
+                        http_status_code=status_code,
+                        attributes={"response_time_ms": duration_ms},
+                    )
+                except Exception as end_trace_error:
+                    logger.warning(f"Failed to end trace {trace_id}: {end_trace_error}")
 
             return response
 
@@ -201,9 +218,11 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
             raise
 
         finally:
-            # Always close database session
+            # Always close database session - observability service handles its own commits
             if db:
                 try:
+                    if db.in_transaction():
+                        db.rollback()
                     db.close()
                 except Exception as close_error:
                     logger.warning(f"Failed to close database session: {close_error}")

@@ -63,10 +63,14 @@ recursive-include alembic *.mako
 recursive-include alembic *.md
 recursive-include alembic *.py
 
-# nginx configuration and docker files
-recursive-include nginx *.conf
-recursive-include nginx *.md
-include nginx/Dockerfile
+# Infrastructure configuration (nginx, monitoring)
+recursive-include infra *.conf
+recursive-include infra *.json
+recursive-include infra *.md
+recursive-include infra *.sh
+recursive-include infra *.yaml
+recursive-include infra *.yml
+include infra/nginx/Dockerfile
 
 # Export/Import functionality (explicitly include new files)
 include mcpgateway/cli_export_import.py
@@ -133,11 +137,15 @@ prune .ruff_cache
 prune .mypy_cache
 prune htmlcov
 
-# Virtual environments
+# Virtual environments (including nested in plugins)
 prune venv
 prune .venv
 prune env
 prune node_modules
+prune plugins/external/opa/.venv
+prune plugins/external/llmguard/.venv
+prune plugins/external/cedar/.venv
+global-exclude **/.venv/*
 
 # Environment files (security sensitive!)
 exclude .env
@@ -150,8 +158,9 @@ exclude *.db
 exclude *.sqlite
 exclude *.log
 
-# Lock files
+# Lock files (including nested in plugins)
 exclude uv.lock
+global-exclude **/uv.lock
 
 # Coverage data
 exclude .coverage
@@ -160,6 +169,7 @@ exclude .coverage.*
 # Additional development config files not needed in package
 exclude .travis.yml
 exclude .eslintrc.json
+exclude eslint.config.js
 exclude .stylelintrc.json
 exclude .markdownlint-cli2.yaml
 exclude .spellcheck-en.txt
@@ -200,3 +210,12 @@ exclude plugins/external/llmguard/Containerfile
 exclude plugins/external/llmguard/MANIFEST.in
 exclude plugins/external/llmguard/pyproject.toml
 exclude plugins/external/llmguard/run-server.sh
+
+# Exclude cedar
+
+exclude plugins/external/cedar/.dockerignore
+exclude plugins/external/cedar/.env.template
+exclude plugins/external/cedar/.ruff.toml
+exclude plugins/external/cedar/Containerfile
+exclude plugins/external/cedar/MANIFEST.in
+exclude plugins/external/cedar/pyproject.toml

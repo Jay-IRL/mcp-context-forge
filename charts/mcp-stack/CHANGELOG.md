@@ -6,6 +6,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 ---
 
+## [1.0.0-BETA-2] - TBD
+
+### Added
+
+#### **🔐 ServiceAccount Support** ([#1718](https://github.com/IBM/mcp-context-forge/pull/1718))
+* Optional ServiceAccount configuration for cloud IAM integration (AWS IRSA, GCP Workload Identity)
+* `serviceAccount.create` - Create a dedicated ServiceAccount for all pods (default: `false`)
+* `serviceAccount.name` - Custom ServiceAccount name (uses release fullname if empty)
+* `serviceAccount.annotations` - IAM role annotations for cloud provider integration
+* `serviceAccount.automountServiceAccountToken` - Control token mounting (default: `true`)
+* Applied to all Deployments and Jobs in the chart
+* Disabled by default to maintain backward compatibility
+
+#### **🔧 Extra Environment Variables Support** ([#2047](https://github.com/IBM/mcp-context-forge/issues/2047))
+* `extraEnv` - Inject additional environment variables directly into the gateway container
+* `extraEnvFrom` - Mount environment variables from existing Secrets or ConfigMaps
+* Enables injection of sensitive credentials (SSO secrets, external DB URLs) without modifying templates
+* Placed after derived URLs so user values can override `DATABASE_URL`/`REDIS_URL` if needed
+* Schema validation catches common mistakes (missing `name`, invalid `secretKeyRef` shape)
+
+### Fixed
+
+* **PgBouncer ServiceAccount** ([#1718](https://github.com/IBM/mcp-context-forge/pull/1718)) - Added missing `serviceAccountName` to pgbouncer deployment for consistency with other components
+
+### Changed
+
+#### **⚡ Metrics Performance Defaults** ([#1799](https://github.com/IBM/mcp-context-forge/issues/1799))
+* **Changed default behavior** - Raw metrics now deleted after hourly rollups exist (1 hour retention)
+  - `METRICS_DELETE_RAW_AFTER_ROLLUP`: `false` → `true`
+  - `METRICS_DELETE_RAW_AFTER_ROLLUP_DAYS` → `METRICS_DELETE_RAW_AFTER_ROLLUP_HOURS` (units now hours)
+  - `METRICS_DELETE_RAW_AFTER_ROLLUP_HOURS`: `168` → `1`
+  - `METRICS_ROLLUP_LATE_DATA_HOURS`: `4` → `1`
+  - `METRICS_CLEANUP_INTERVAL_HOURS`: `24` → `1`
+  - `METRICS_RETENTION_DAYS`: `30` → `7`
+* **Rationale**: Prevents unbounded table growth under sustained load while preserving analytics in hourly rollups
+* **Opt-out**: Set `METRICS_DELETE_RAW_AFTER_ROLLUP=false` to preserve previous behavior
+* **External observability**: If using ELK, Datadog, or similar platforms, raw metrics are redundant - the new defaults are optimal
+
+## [0.9.1] - 2025-12-03
+
+### Added
+* **Helm Hook Support for Migration Job** - enable recreation of the migration Job on every deployment
+  - helm.sh/hook: pre-install,pre-upgrade — ensures the migration Job runs automatically during installs and upgrades
+  - helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded — removes old migration Jobs to prevent immutable field errors
+  - Eliminates upgrade failures caused by changes to spec.template in Kubernetes Jobs
+
+### Changed
+* **Chart version** - Bumped to 0.9.1 for migration job fix
+
 ## [0.9.0] - 2025-11-05
 
 ### Added

@@ -31,9 +31,9 @@ Examples:
     True
     >>> _is_secret("HOSTNAME")
     False
-    >>> _sanitize_url("redis://user:pass@localhost:6379/0")
+    >>> _sanitize_url("redis://user:xxxxx@localhost:6379/0")
     'redis://user@localhost:6379/0'
-    >>> _sanitize_url("postgresql://admin:secret@db.example.com/mydb")
+    >>> _sanitize_url("postgresql://admin:xxxxx@db.example.com/mydb")
     'postgresql://admin@db.example.com/mydb'
     >>> _sanitize_url("https://example.com/path")
     'https://example.com/path'
@@ -53,7 +53,7 @@ from __future__ import annotations
 # Standard
 import asyncio
 from datetime import datetime, timezone
-import json
+import importlib.util
 import os
 import platform
 import socket
@@ -63,14 +63,17 @@ from urllib.parse import urlsplit, urlunsplit
 
 # Third-Party
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
+import orjson
 from sqlalchemy import text
 
 # First-Party
 from mcpgateway import __version__
 from mcpgateway.config import settings
 from mcpgateway.db import engine
+from mcpgateway.utils.orjson_response import ORJSONResponse
+from mcpgateway.utils.redis_client import get_redis_client, is_redis_available
 from mcpgateway.utils.verify_credentials import require_auth
 
 # Optional runtime dependencies
@@ -81,12 +84,14 @@ except ImportError:
     psutil = None  # type: ignore
 
 try:
-    # Third-Party
-    import redis.asyncio as aioredis  # optional Redis health check
+    REDIS_AVAILABLE = importlib.util.find_spec("redis.asyncio") is not None
+except (ModuleNotFoundError, AttributeError) as e:
+    # ModuleNotFoundError: redis package not installed
+    # AttributeError: 'redis' exists but isn't a proper package (e.g., shadowed by a file)
+    # Standard
+    import logging
 
-    REDIS_AVAILABLE = True
-except ImportError:
-    aioredis = None  # type: ignore
+    logging.getLogger(__name__).warning(f"Redis module check failed ({type(e).__name__}: {e}), Redis support disabled")
     REDIS_AVAILABLE = False
 
 # Globals
@@ -182,15 +187,15 @@ def _public_env() -> Dict[str, str]:
         >>> os.environ.update({
         ...     "HOME": "/home/user",
         ...     "PATH": "/usr/bin:/bin",
-        ...     "DATABASE_PASSWORD": "secret123",
-        ...     "API_KEY": "abc123",
+        ...     "DATABASE_PASSWORD": "xxxxx",
+        ...     "API_KEY": "xxxxx",
         ...     "DEBUG": "true",
         ...     "BASIC_AUTH_USER": "admin",
-        ...     "BASIC_AUTH_PASSWORD": "pass123",
-        ...     "JWT_SECRET_KEY": "jwt-secret",
-        ...     "AUTH_ENCRYPTION_SECRET": "enc-secret",
-        ...     "DATABASE_URL": "postgresql://user:pass@localhost/db",
-        ...     "REDIS_URL": "redis://user:pass@localhost:6379",
+        ...     "BASIC_AUTH_PASSWORD": "xxxxx",
+        ...     "JWT_SECRET_KEY": "xxxxx",
+        ...     "AUTH_ENCRYPTION_SECRET": "xxxxx",
+        ...     "DATABASE_URL": "postgresql://user:xxxxx@localhost/db",
+        ...     "REDIS_URL": "redis://user:xxxxx@localhost:6379",
         ...     "APP_NAME": "MyApp",
         ...     "PORT": "8080"
         ... })
@@ -255,19 +260,19 @@ def _sanitize_url(url: Optional[str]) -> Optional[str]:
         'http://localhost:8080/path'
 
         >>> # URL with username and password
-        >>> _sanitize_url("postgresql://user:password@localhost:5432/db")
+        >>> _sanitize_url("postgresql://user:xxxxx@localhost:5432/db")
         'postgresql://user@localhost:5432/db'
 
         >>> # Redis URL with auth
-        >>> _sanitize_url("redis://admin:secret123@redis.example.com:6379/0")
+        >>> _sanitize_url("redis://admin:xxxxx@redis.example.com:6379/0")
         'redis://admin@redis.example.com:6379/0'
 
         >>> # URL with only password (no username)
-        >>> _sanitize_url("redis://:password@localhost:6379")
+        >>> _sanitize_url("redis://:xxxxx@localhost:6379")
         'redis://localhost:6379'
 
         >>> # Complex URL with query params
-        >>> _sanitize_url("mysql://root:pass@db.local:3306/mydb?charset=utf8")
+        >>> _sanitize_url("mysql://root:xxxxx@db.local:3306/mydb?charset=utf8")
         'mysql://root@db.local:3306/mydb?charset=utf8'
     """
     if not url:
@@ -548,6 +553,10 @@ def _build_payload(
             "cache_type": settings.cache_type,
             "mcpgateway_ui_enabled": getattr(settings, "mcpgateway_ui_enabled", None),
             "mcpgateway_admin_api_enabled": getattr(settings, "mcpgateway_admin_api_enabled", None),
+            "metrics_retention_days": getattr(settings, "metrics_retention_days", 30),
+            "metrics_rollup_retention_days": getattr(settings, "metrics_rollup_retention_days", 365),
+            "metrics_cleanup_enabled": getattr(settings, "metrics_cleanup_enabled", True),
+            "metrics_rollup_enabled": getattr(settings, "metrics_rollup_enabled", True),
         },
         "env": _public_env(),
         "system": _system_metrics(),
@@ -582,14 +591,14 @@ def _html_table(obj: Dict[str, Any]) -> str:
         True
         >>> '<th>active</th><td>true</td>' in html
         True
-        >>> '<th>items</th><td>["a", "b"]</td>' in html
+        >>> '<th>items</th><td>["a","b"]</td>' in html
         True
 
         >>> # Empty dict
         >>> _html_table({})
         '<table></table>'
     """
-    rows = "".join(f"<tr><th>{k}</th><td>{json.dumps(v, default=str) if not isinstance(v, str) else v}</td></tr>" for k, v in obj.items())
+    rows = "".join(f"<tr><th>{k}</th><td>{orjson.dumps(v, default=str).decode() if not isinstance(v, str) else v}</td></tr>" for k, v in obj.items())
     return f"<table>{rows}</table>"
 
 
@@ -776,46 +785,55 @@ async def version_endpoint(
         >>> isinstance(response, HTMLResponse)
         True
 
-        >>> # Test with Redis available
+        >>> # Test with Redis available (using is_redis_available and get_redis_client)
         >>> async def test_with_redis():
+        ...     from mcpgateway.utils.redis_client import _reset_client
+        ...     _reset_client()  # Reset shared client state for clean test
         ...     mock_redis = AsyncMock()
-        ...     mock_redis.ping = AsyncMock(return_value=True)
         ...     mock_redis.info = AsyncMock(return_value={"redis_version": "7.0.5"})
+        ...
+        ...     async def mock_get_redis_client():
+        ...         return mock_redis
+        ...
+        ...     async def mock_is_redis_available():
+        ...         return True
         ...
         ...     with patch('mcpgateway.version.REDIS_AVAILABLE', True):
         ...         with patch('mcpgateway.version.settings') as mock_settings:
         ...             mock_settings.cache_type = "redis"
         ...             mock_settings.redis_url = "redis://localhost:6379"
-        ...             with patch('mcpgateway.version.aioredis.Redis.from_url', return_value=mock_redis):
-        ...                 with patch('mcpgateway.version._build_payload') as mock_build:
-        ...                     mock_build.return_value = {"redis": {"version": "7.0.5"}}
-        ...                     response = await version_endpoint(mock_request, _user="testuser")
-        ...                     # Verify Redis was checked
-        ...                     mock_redis.ping.assert_called_once()
-        ...                     mock_redis.info.assert_called_once()
-        ...                     # Verify payload was built with Redis info
-        ...                     mock_build.assert_called_once_with("7.0.5", True)
-        ...                     return response
+        ...             with patch('mcpgateway.version.is_redis_available', mock_is_redis_available):
+        ...                 with patch('mcpgateway.version.get_redis_client', mock_get_redis_client):
+        ...                     with patch('mcpgateway.version._build_payload') as mock_build:
+        ...                         mock_build.return_value = {"redis": {"version": "7.0.5"}}
+        ...                         response = await version_endpoint(mock_request, _user="testuser")
+        ...                         # Verify Redis info was retrieved
+        ...                         mock_redis.info.assert_called_once()
+        ...                         # Verify payload was built with Redis info
+        ...                         mock_build.assert_called_once_with("7.0.5", True)
+        ...                         _reset_client()  # Clean up after test
+        ...                         return response
         >>>
         >>> response = asyncio.run(test_with_redis())
         >>> isinstance(response, JSONResponse)
         True
     """
-    # Redis health check
+    # Redis health check - use shared client from factory
     redis_ok = False
     redis_version: Optional[str] = None
-    if REDIS_AVAILABLE and aioredis and settings.cache_type.lower() == "redis" and settings.redis_url:
+    if REDIS_AVAILABLE and settings.cache_type.lower() == "redis" and settings.redis_url:
         try:
-            client = aioredis.Redis.from_url(settings.redis_url)
-
-            response = await asyncio.wait_for(client.ping(), timeout=3.0)
-            if response is True:
-                redis_ok = True
-                info = await asyncio.wait_for(client.info(), timeout=3.0)
-                redis_version = info.get("redis_version", "unknown")
+            # Use centralized availability check
+            redis_ok = await is_redis_available()
+            if redis_ok:
+                client = await get_redis_client()
+                if client:
+                    info = await asyncio.wait_for(client.info(), timeout=3.0)
+                    redis_version = info.get("redis_version", "unknown")
+                else:
+                    redis_version = "Client not available"
             else:
-                redis_ok = False
-                redis_version = "Ping failed"
+                redis_version = "Not reachable"
         except Exception as exc:
             redis_ok = False
             redis_version = str(exc)
@@ -823,9 +841,9 @@ async def version_endpoint(
     payload = _build_payload(redis_version, redis_ok)
     if partial:
         # Return partial HTML fragment for HTMX embedding
-        templates = Jinja2Templates(directory=str(settings.templates_dir))
+        templates = Jinja2Templates(directory=str(settings.templates_dir), auto_reload=settings.templates_auto_reload)
         return templates.TemplateResponse(request, "version_info_partial.html", {"request": request, "payload": payload})
     wants_html = fmt == "html" or "text/html" in request.headers.get("accept", "")
     if wants_html:
         return HTMLResponse(_render_html(payload))
-    return JSONResponse(payload)
+    return ORJSONResponse(payload)

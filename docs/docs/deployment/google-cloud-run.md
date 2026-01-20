@@ -16,7 +16,7 @@ Google Cloud Run is an ideal platform for MCP Gateway due to its:
 You can deploy the public image directly:
 
 ```text
-ghcr.io/ibm/mcp-context-forge:0.9.0
+ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1
 ```
 
 ---
@@ -129,7 +129,7 @@ AUTH_REQUIRED=true
 # ─── Cloud SQL (PostgreSQL) ─────────────────────────────────
 SQL_INSTANCE=mcpgw-db
 SQL_REGION=us-central1
-DATABASE_URL=postgresql://postgres:<PASSWORD>@<SQL_IP>:5432/mcpgw
+DATABASE_URL=postgresql+psycopg://postgres:<PASSWORD>@<SQL_IP>:5432/mcpgw
 
 # ─── Memorystore (Redis) ────────────────────────────────────
 REDIS_INSTANCE=mcpgw-redis
@@ -279,7 +279,7 @@ JWT_SECRET_KEY=jwt-secret-key,\
 BASIC_AUTH_USER=admin,\
 BASIC_AUTH_PASSWORD=changeme,\
 AUTH_REQUIRED=true,\
-DATABASE_URL=postgresql://postgres:mysecretpassword@<SQL_IP>:5432/mcpgw,\
+DATABASE_URL=postgresql+psycopg://postgres:mysecretpassword@<SQL_IP>:5432/mcpgw,\
 REDIS_URL=redis://<REDIS_IP>:6379/0,\
 CACHE_TYPE=redis,\
 HOST=0.0.0.0,\
@@ -302,7 +302,7 @@ gcloud run services logs read mcpgateway --region=us-central1
 You can use any PostgreSQL client, such as `psql`. You should see the list of tables when using `dt;`
 
 ```bash
-psql postgresql://postgres:mysecretpassword@<SQL_IP>:5432/mcpgw
+psql postgresql+psycopg://postgres:mysecretpassword@<SQL_IP>:5432/mcpgw
 
 mcpgw=> \dt;
                     List of relations
@@ -336,7 +336,7 @@ mcpgw=> \dt;
 Use the MCP Gateway container to generate a JWT token:
 
 ```bash
-docker run -it --rm ghcr.io/ibm/mcp-context-forge:0.9.0 \
+docker run -it --rm ghcr.io/ibm/mcp-context-forge:1.0.0-BETA-1 \
   python3 -m mcpgateway.utils.create_jwt_token -u admin@example.com --secret jwt-secret-key
 ```
 

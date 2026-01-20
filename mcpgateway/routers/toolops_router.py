@@ -15,16 +15,17 @@ The module handles API endpoints created for several toolops features.
 """
 
 # Standard
-import json
 from typing import Any, Dict, List
 
 # Third-Party
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+import orjson
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 # First-Party
 from mcpgateway.main import get_db
+from mcpgateway.middleware.rbac import get_current_user_with_permissions, require_permission
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.services.tool_service import ToolService
 from mcpgateway.toolops.toolops_altk_service import enrich_tool, execute_tool_nl_test_cases, validation_generate_test_cases
@@ -49,6 +50,7 @@ class ToolNLTestInput(BaseModel):
     Args:
         tool_id : Unique Tool ID
         tool_nl_test_cases: List of natural language test cases for testing MCP tool with the agent
+        model_id : LLM model used for toolops functionality
 
     Returns:
         This class defines tool NL test input format and returns nothing.
@@ -56,6 +58,7 @@ class ToolNLTestInput(BaseModel):
 
     tool_id: str | None = Field(default=None, title="Tool ID", max_length=300)
     tool_nl_test_cases: list | None = Field(default=None, title="List of natural language test cases for testing MCP tool with the agent")
+    model_id: str | None = Field(default=None, title="LLM Model ID", max_length=300)
 
 
 # ---------- ROUTES ----------
@@ -64,12 +67,15 @@ class ToolNLTestInput(BaseModel):
 # First-Party
 # Toolops APIs - Generating test cases , Tool enrichment #
 @toolops_router.post("/validation/generate_testcases")
+@require_permission("admin.system_config")
 async def generate_testcases_for_tool(
+    model_id: str = Query(None, description="LLM Model ID for toolops"),
     tool_id: str = Query(None, description="Tool ID"),
     number_of_test_cases: int = Query(2, description="Maximum number of tool test cases"),
     number_of_nl_variations: int = Query(1, description="Number of NL utterance variations per test case"),
     mode: str = Query("generate", description="Three modes: 'generate' for test case generation, 'query' for obtaining test cases from DB , 'status' to check test generation status"),
     db: Session = Depends(get_db),
+    _user=Depends(get_current_user_with_permissions),
 ) -> List[Dict]:
     """
     Generate test cases for a tool
@@ -79,6 +85,7 @@ async def generate_testcases_for_tool(
     the user is authenticated before proceeding.
 
     Args:
+        model_id : LLM model used for toolops functionality
         tool_id: Tool ID in context forge.
         number_of_test_cases: Number of test cases to generate for the given tools (optional)
         number_of_nl_variations: Number of Natural language variations(parapharses) per test case (optional)
@@ -93,10 +100,10 @@ async def generate_testcases_for_tool(
     """
     try:
         # logger.debug(f"Authenticated user {user} is initializing the protocol.")
-        test_cases = await validation_generate_test_cases(tool_id, tool_service, db, number_of_test_cases, number_of_nl_variations, mode)
+        test_cases = await validation_generate_test_cases(model_id, tool_id, tool_service, db, number_of_test_cases, number_of_nl_variations, mode)
         return test_cases
 
-    except json.JSONDecodeError:
+    except orjson.JSONDecodeError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid JSON in request body",
@@ -104,7 +111,8 @@ async def generate_testcases_for_tool(
 
 
 @toolops_router.post("/validation/execute_tool_nl_testcases")
-async def execute_tool_nl_testcases(tool_nl_test_input: ToolNLTestInput, db: Session = Depends(get_db)) -> List:
+@require_permission("admin.system_config")
+async def execute_tool_nl_testcases(tool_nl_test_input: ToolNLTestInput, db: Session = Depends(get_db), _user=Depends(get_current_user_with_permissions)) -> List:
     """
     Execute test cases for a tool
 
@@ -115,7 +123,8 @@ async def execute_tool_nl_testcases(tool_nl_test_input: ToolNLTestInput, db: Ses
     Args:
         tool_nl_test_input: NL test case format input to run test cases with agent , it contains\
             - tool_id: Tool ID in context forge\
-            - tool_nl_test_cases: List of natural language test cases (utteances) for testing MCP tool with the agent
+            - tool_nl_test_cases: List of natural language test cases (utteances) for testing MCP tool with the agent\
+            - model_id : LLM model used for toolops functionality
         db: DB session to connect with database
 
     Returns:
@@ -128,10 +137,11 @@ async def execute_tool_nl_testcases(tool_nl_test_input: ToolNLTestInput, db: Ses
         # logger.debug(f"Authenticated user {user} is initializing the protocol.")
         tool_id = tool_nl_test_input.tool_id
         tool_nl_test_cases = tool_nl_test_input.tool_nl_test_cases
-        tool_nl_test_cases_output = await execute_tool_nl_test_cases(tool_id, tool_nl_test_cases, tool_service, db)
+        model_id = tool_nl_test_input.model_id
+        tool_nl_test_cases_output = await execute_tool_nl_test_cases(model_id, tool_id, tool_nl_test_cases, tool_service, db)
         return tool_nl_test_cases_output
 
-    except json.JSONDecodeError:
+    except orjson.JSONDecodeError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid JSON in request body",
@@ -139,11 +149,18 @@ async def execute_tool_nl_testcases(tool_nl_test_input: ToolNLTestInput, db: Ses
 
 
 @toolops_router.post("/enrichment/enrich_tool")
-async def enrich_a_tool(tool_id: str = Query(None, description="Tool ID"), db: Session = Depends(get_db)) -> dict[str, Any]:
+@require_permission("admin.system_config")
+async def enrich_a_tool(
+    model_id: str = Query(None, description="LLM Model ID for toolops"),
+    tool_id: str = Query(None, description="Tool ID"),
+    db: Session = Depends(get_db),
+    _user=Depends(get_current_user_with_permissions),
+) -> dict[str, Any]:
     """
     Enriches an input tool
 
     Args:
+        model_id : LLM model used for toolops functionality
         tool_id: Unique Tool ID MCP-CF.
         db: The database session used to interact with the data store.
 
@@ -155,7 +172,7 @@ async def enrich_a_tool(tool_id: str = Query(None, description="Tool ID"), db: S
     """
     try:
         logger.info("Running tool enrichment for Tool - " + tool_id)
-        enriched_tool_description, tool_schema = await enrich_tool(tool_id, tool_service, db)
+        enriched_tool_description, tool_schema = await enrich_tool(model_id, tool_id, tool_service, db)
         result: dict[str, Any] = {}
         result["tool_id"] = tool_id
         result["tool_name"] = tool_schema.name
